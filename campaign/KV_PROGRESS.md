@@ -81,7 +81,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-08 decode correctness + speed gate | DONE | section below; probes byte-identical to f16 + Phase 0 baseline; decode +0.09/+0.27/+0.10 pct vs same-binary f16 (noise) |
 | KV-09 global layers derived-K | DONE | section below; reconstruction max_abs_err 0.015822, SNR 47.14 dB; probes byte-identical to f16 |
 | KV-10 global validation gate | DONE | section below; Phase 4 gate PASSED; probes identical excl load timing; matrix kv10-q8 vs kv10-f16 recorded |
-| KV-11 non-WMMA prefill q8_0 | PENDING | |
+| KV-11 non-WMMA prefill q8_0 | DONE | section below; probes byte-identical q8 vs f16; pp4096 +40.7 pct, pp16384 +103.8 pct vs KV-10 q8 |
 | KV-12 WMMA prefill / dispatch rule | PENDING | |
 | KV-13 machinery re-proof | PENDING | |
 | KV-14 full-stack integration | PENDING | |
@@ -486,6 +486,79 @@ the real attention path); the mixed-cache fallback is NOT
 needed. Full q8_0 ships forward to Phase 5.
 
 Next (KV-11): Phase 5 -- non-WMMA prefill reads/writes q8_0.
+
+## Phase 5 first slice (KV-11) -- non-WMMA prefill q8_0
+
+Audit (2026-11-17, device): prefill writes already quantize at
+every width -- QkvPost is width-agnostic and the executor passes
+the q8_0 store pointers for every layer (KV-05/KV-06/KV-09).
+The read side was the interim KV-07/KV-09 routing: at prefill
+widths a q8_0 layer took the single-pass AttentionKernel, whose
+AttendKeys dequantizes every key once per (row, head) -- the
+KV-10 matrix priced that at pp16384 534.10 t/s.
+
+What landed:
+- `hip/kernels.hip.cpp` LaunchAttention: at prefill widths
+  (rows > kSplitRows) a q8_0 layer now runs the split kernel in
+  kSplitRows-row blocks (per-block AttentionArgs: q/out and
+  key_ends offset, first_position advanced, pack_row0 offset,
+  out_half narrowed once over the full rows afterwards). The
+  split kernel's staged tiles dequantize each q8_0 cache tile
+  once for the rows and query heads sharing the block -- at
+  hd512 the tile is staged in shared memory and serves all
+  eight query heads of the KV head -- and its per-row
+  arithmetic is batch-invariant, so a prefill row computes
+  exactly what the decode path computes for it (the KV-07/KV-09
+  read paths, derived-key reconstruction included; chunked
+  prefill via prefill_chunk and multi-chunk sessions ride the
+  same road). Shapes the split kernel does not take (non-
+  production head grouping, shared-position batches) keep the
+  single-pass AttendKeys road as fallback. The f16 route is
+  untouched: WMMA first, single-pass on decline, exactly as
+  before. The WMMA q8_0 dequant-tile stage / dispatch rule is
+  KV-12, not this slice.
+- `hip/executor.cpp`: comment updated (KV-07/KV-11 non-WMMA
+  path). No behavior change there.
+
+Verification (2026-11-17, device; binary result ->
+/nix/store/95kf8hkd...-gufo-0-unstable-4938016;
+MemAvailable ~124.5 GiB at start):
+- nix build: clean (detached, ~4 min wall). clang-format clean
+  on both touched files. Standalone compile of the registered
+  kv_cache_format test -> PASS (roundtrip/reconstruction
+  numbers unchanged: K 0.010000 / 48.25 dB, V 0.010000 /
+  48.15 dB, ring 0.006234, derived-K 0.015822 / 47.14 dB).
+- Probes (full harness, labels kv11-q8 / kv11-f16, results
+  device-side): all five byte-identical q8_0 vs same-binary
+  f16 excluding the [Model Load] timing line, and both
+  identical to the KV-10 runs -- FACT-1 `Paris`, FACT-2 `Au`,
+  FACT-3 `366`, COH-1 identical text, LONG-1 `47-12-89`
+  (15,739 prompt tokens through serve; prefill_chunk 2048, so
+  eight prefill chunks read earlier chunks' q8_0 cache through
+  the new path, sliding window/ring and global derived-K
+  layers alike).
+- Matrix medians (tok/s, 5 runs, 1 warmup discarded), KV-11
+  binary, q8_0 vs same-binary f16 (KV-10 q8 in parens):
+  pp512 1610.81 vs 2201.36 (1713.89; -6.0 pct vs KV-10 q8 --
+  a small short-context cost of the block-launch road),
+  pp4096 1447.54 vs 2917.83 (1029.10; +40.7 pct),
+  pp16384 1088.75 vs 2527.32 (534.10; +103.8 pct),
+  tg512 37.93 vs 42.02, tg4096 36.82 vs 40.61,
+  tg16384 35.43 vs 39.26 (decode within +-0.1 pct of KV-10
+  q8 -- the decode path is untouched). f16 vs KV-10 f16:
+  within +0.05..+0.55 pct on all six configs -- noise, f16
+  unchanged. q8_0 prefill still trails the WMMA f16 path
+  (-26.8 / -50.4 / -56.9 pct); closing that, or dispatching
+  around it, is the KV-12 gate's work and is NOT claimed here.
+- Error paths unchanged: env `bogus` -> named error; flag
+  `q4_0` -> reserved error. Installed profile and
+  gufo-resident.service untouched; Ollama (:11434) untouched.
+
+Next (KV-12): WMMA matrix-core prefill dequant-tile stage, or
+the measured dispatch rule (q8_0 prefill takes the faster path
+per context size, crossover measured); the Phase 5 gate
+(prefill matrix vs the matrix-core f16 baseline, no regression
+beyond noise) is decided there.
 
 ## Phase gates
 

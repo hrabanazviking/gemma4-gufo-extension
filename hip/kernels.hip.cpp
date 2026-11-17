@@ -1862,13 +1862,61 @@ __global__ void NarrowKernel(const float* x, __half* out, std::size_t count) {
 
 template<int D>
 void LaunchAttention(const AttentionArgs& a, hipStream_t stream) {
+  // Gemma 4 groups 2 query heads per KV head at hd256, 8 at hd512.
+  constexpr std::uint32_t kGroup = D == 256 ? 2 : 8;
   if (a.rows > kSplitRows) {
+    if (a.k_cache_q8 != nullptr) {
+      // KV-11: non-WMMA prefill over a q8_0 cache. The rows run
+      // through the split kernel in kSplitRows-row blocks: its
+      // staged tiles dequantize each q8_0 cache tile once for the
+      // rows and query heads sharing the block (at hd512 the tile
+      // is staged in shared memory and serves all eight query
+      // heads of the KV head), where the single-pass kernel
+      // dequantized every key once per (row, head). The split
+      // kernel's per-row arithmetic is batch-invariant, so a
+      // prefill row computes exactly what the decode path
+      // computes for it -- the KV-07/KV-09 read paths, derived-key
+      // reconstruction included. Prefill writes already quantize
+      // in QkvPost (KV-05/KV-06/KV-09) at every width. The WMMA
+      // prefill kernel reads binary16 tiles only; a q8_0 WMMA
+      // dequant-tile stage or a dispatch rule between the two
+      // prefill paths is KV-12.
+      if (a.out == nullptr) {
+        throw std::invalid_argument("this attention needs its FP32 output");
+      }
+      if (!a.shared_position && a.heads == a.kv_heads * kGroup) {
+        for (std::uint32_t row0 = 0; row0 < a.rows; row0 += kSplitRows) {
+          AttentionArgs sub = a;
+          sub.rows = std::min(kSplitRows, a.rows - row0);
+          sub.q = a.q + std::size_t{row0} * a.heads * D;
+          sub.out = a.out + std::size_t{row0} * a.heads * D;
+          sub.out_half = nullptr;
+          sub.first_position = a.first_position + row0;
+          sub.key_ends = a.key_ends != nullptr ? a.key_ends + row0 : nullptr;
+          sub.pack_row0 = a.pack_row0 + row0;
+          LaunchSplitAttention<D, kGroup>(sub, stream);
+        }
+      } else {
+        // Shapes the split kernel does not take keep the
+        // KV-07/KV-09 single-pass road (AttendKeys dequantizes).
+        if (a.rope_pairs != 0 && a.v_cache_q8 == nullptr) {
+          throw std::invalid_argument(
+              "derived keys need the WMMA prefill path");
+        }
+        AttentionKernel<D>
+            <<<dim3(1, a.heads, a.rows), kThreads, 0, stream>>>(a);
+      }
+      if (a.out_half != nullptr) {
+        const std::size_t count = std::size_t{a.rows} * a.heads * D;
+        NarrowKernel<<<static_cast<unsigned>((count + kThreads - 1) / kThreads),
+                       kThreads, 0, stream>>>(
+            a.out, static_cast<__half*>(a.out_half), count);
+      }
+      return;
+    }
     // KV-07: the WMMA prefill kernel reads binary16 cache tiles; a
-    // q8_0 sliding cache takes the single-pass kernel instead, which
-    // dequantizes in-kernel (the WMMA dequant-tile stage is KV-12).
-    // KV-09: a q8_0 derived-key (global) layer takes the same road --
-    // AttendKeys reconstructs its keys from the two q8_0 stores.
-    if (a.k_cache_q8 != nullptr || !LaunchWmmaPrefillAttention(a, stream)) {
+    // shape it declines takes the single-pass kernel instead.
+    if (!LaunchWmmaPrefillAttention(a, stream)) {
       if (a.rope_pairs != 0 && a.v_cache_q8 == nullptr) {
         throw std::invalid_argument("derived keys need the WMMA prefill path");
       }
@@ -1885,8 +1933,6 @@ void LaunchAttention(const AttentionArgs& a, hipStream_t stream) {
     }
     return;
   }
-  // Gemma 4 groups 2 query heads per KV head at hd256, 8 at hd512.
-  constexpr std::uint32_t kGroup = D == 256 ? 2 : 8;
   if (a.heads != a.kv_heads * kGroup) {
     throw std::invalid_argument("split attention head grouping unsupported");
   }

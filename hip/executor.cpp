@@ -1016,8 +1016,8 @@ void Executor::Forward(std::span<const Segment> segments,
       att.q = q_ + std::size_t{row0} * c.QDim(l);
       att.k_cache = cache.k[l];
       att.v_cache = cache.v[l];
-      // KV-07: a q8_0 layer at prefill widths takes the
-      // single-pass kernel (LaunchAttention), which needs its FP32
+      // KV-07/KV-11: a q8_0 layer at prefill widths takes the
+      // non-WMMA path in LaunchAttention, which needs its FP32
       // output; the binary16 copy the prefill projection consumes
       // is narrowed from it there. Other layers keep the WMMA
       // route's null FP32 output when the output projection is
