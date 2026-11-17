@@ -1593,3 +1593,152 @@ becomes any default.
 Tick state: MemAvailable ~124 GiB, Ollama :11434 and
 gufo-resident untouched, lock held during work and
 removed at tick end.
+
+## Phase 5 REDO R6 -- E1 fused-V scale-folding: AUDIT-ONLY (2026-11-17)
+
+Audit-only tick (builder, 18:49 EST keeper dispatch). No kernel
+code was changed, no build or bench was run. This section is
+the complete deliverable.
+
+### Decision rule, recorded BEFORE any implementation (R6 law)
+
+Per campaign/KV_PHASE5_REDO.md R6 E1 (lines 129-133) and the
+R7 round 4 revert entry above: E1 may bank ONLY if probes are
+byte-identical plus host PASS, a gate may be claimed ONLY via
+a separate R5 run, and ONLY the variant that reproduces the
+staged rounding of dequantized V qualifies. A variant that
+changes the rounding of V is disqualified by design, not
+debated. Terminology note: the redo plan and this campaign
+say bf16, but the code stages binary16 __half (fp16): Wmma
+at hip/attention_wmma.hip.cpp:42 is the f16 WMMA builtin
+__builtin_amdgcn_wmma_f32_16x16x16_f16_w32, and every staged
+operand is __half. The rounding at issue is that __half
+rounding.
+
+### Findings (a): where V scales live, and their granularity
+
+- Layout v2 (DequantQ8Chunk, lines 140-159; DequantQ8Packed,
+  lines 64-79): a V row in v_cache_q8 holds all q8_0 block
+  codes contiguously in a payload plane, then a separate
+  scale plane. The scale for one block is read at
+  row + (row_bytes / 34) * 32 + blk * 2, where
+  blk = kvh * (per_head / 32) + dim0 / 32. So granularity is
+  ONE fp16 scale per (key slot, KV head, 32 consecutive head
+  dims) -- per 32-value block, shared by four 8-value chunks.
+- LoadQ8BlockRaw (line 85) and LoadQ8HalfBlockRaw
+  (line 118) load the same scale once per block or half
+  block; the fused fetch paths (global V at lines 481-482,
+  sliding V at line 601, generic V via DequantQ8Chunk at
+  lines 631-632) each apply it inside DequantQ8Packed:
+  cvt.h[i] = __hmul(__int2half_rn(code), scale), i.e. each
+  staged value is code * scale rounded ONCE to __half.
+- The scale is consumed at fetch and then DISCARDED.
+  store_values (lines 685-757) writes only the dequantized
+  __half values, transposed, into vt_lds (declared line 256
+  as __half vt_lds[D * kVtStride], kVtStride = kKeys + 8).
+  No scale sidecar exists in LDS, so at PV time the scale
+  is unrecoverable from vt_lds; a fold would have to carry
+  the per-(key, dim-block) scales separately through the
+  whole tile lifetime.
+- PV consumption: p_frag is loaded ONCE from p_lds at line
+  846 and reused for every dim step; the PV loop (lines
+  867-876) loads v_cur = LoadFrag(vt_lds rows for dim slice
+  t) and computes o_acc[t] = Wmma(p_frag, v_cur, o_acc[t])
+  at line 876. The WMMA contraction is over the 16 KEYS of
+  the tile; the output dim slice t spans 16 dims, so one
+  dim slice lies inside one 32-block, but successive t
+  slices use DIFFERENT dim blocks and therefore different
+  V scales for the same key.
+
+### Findings (b): folding V scales into P cannot reproduce the staged rounding
+
+The staged PV term for (row, key, dim) is, exactly:
+  P_h * V_h, where P_h = __float2half(exp softmax weight)
+  written to p_lds at line 818, and
+  V_h = __hmul(code, scale) from DequantQ8Packed.
+Both WMMA operands are __half, the per-term product of two
+fp16 values is exact in fp32, and Wmma accumulates in fp32.
+Bit-identity therefore requires the folded road to present
+the WMMA with operand pairs whose fp32 products are the
+same values, term by term, in the same accumulation.
+No fold does that:
+
+1. Fold into P before the WMMA: the scaled probability
+   P * scale is not an operand the WMMA can take -- Wmma
+   (line 42) accepts only fp16 A and B, and p_lds (line 261)
+   is __half. The folded value must round to __half first,
+   giving term __float2half(P_fp32 * scale) * code_h
+   (code_h exact), versus the staged
+   __float2half(P_fp32) * __hmul(code, scale). Rounding
+   (P * scale) to fp16 is not the same operation as
+   rounding (code * scale) to fp16 and multiplying by the
+   separately rounded P: multiplication does not commute
+   with rounding, the two intermediates have different
+   mantissas and exponents, and each road rounds a
+   different product exactly once. The results differ for
+   general (P, code, scale) triples, so probes cannot be
+   guaranteed byte-identical -- they would differ whenever
+   the two roundings diverge on any term.
+2. Fold into P in fp32 and keep fp32 accumulation: there
+   is no such path in this kernel. Softmax weights are
+   rounded to __half in p_lds (line 818) BEFORE the PV
+   loop, by design, and the only matrix product available
+   is the f16 WMMA at line 42. Keeping P in fp32 until
+   after scaling would itself change the staged P rounding
+   (removing the line 818 rounding), a second, independent
+   change to the arithmetic.
+3. Factor the scale out of the WMMA into the fp32
+   accumulator: impossible in general. The scale depends
+   on the CONTRACTION index (the key) as well as on the
+   dim block: o[t] = sum over keys of P[key] * code[key]
+   * scale[key, block(t)]. A per-key factor inside the sum
+   cannot be factored out of o_acc[t] after Wmma returns;
+   the 16 keys of a tile come from 16 different cache rows
+   with 16 independent scales. Factoring would require all
+   16 scales to be equal, which the q8_0 layout does not
+   guarantee.
+4. Per-dim-slice scaled P fragments (one p_frag per t,
+   scaled by scale[key, block(t)] in registers) fix the
+   granularity problem in (a) -- the same p_frag cannot
+   carry two different dim-block scales -- but not the
+   rounding problem in (1): each scaled fragment still
+   rounds (P * scale) to fp16 instead of presenting
+   (code * scale) rounded to fp16. Same disqualification.
+   It would also multiply the P fragment work by
+   kSliceSteps and need the scales staged in LDS or
+   registers per tile, for a variant already disqualified.
+
+The only road that reproduces the staged rounding exactly
+is the staged road itself: round (code * scale) to __half
+once, in DequantQ8Packed, which is what the current kernel
+already does. That is not a fold; it is the status quo.
+
+### Conclusion
+
+E1 is DISQUALIFIED BY DESIGN. No bit-identical fused-V
+scale-folding variant exists in this kernel without
+changing the rounding of dequantized V, which the R6 E1
+decision rule forbids. No bounded buildable variant is
+spec-ed, because spec-ing one would violate the rule
+recorded above. No code was changed and nothing from E1
+ships or banks as a kernel slice; this audit section is
+the banked result.
+
+### Next step
+
+R6 E2: the int8-WMMA QK spike, microbenchmark only, under
+its own decision rule recorded before it starts (redo plan
+lines 134-145: if variant B cannot beat the fused R2 path,
+int8 QK is abandoned permanently; a fast spike is still
+expected to fail byte identity and is a measurement, not
+a shipping candidate). Phase 6 (KV-13) does NOT start.
+No quantized mode becomes any default.
+
+### Tick state
+
+MemAvailable 124,390,724 kB at tick start and 124,399,820
+kB at audit end (about 124 GiB, well above the 40 GiB
+stand-down floor). No build or bench ran. Ollama :11434
+and gufo-resident.service untouched. Lock held during the
+audit and removed before the banking commit, so no lock
+remains at tick end.
