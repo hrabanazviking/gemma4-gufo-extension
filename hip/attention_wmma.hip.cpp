@@ -43,6 +43,40 @@ __device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
 
+/// KV-12: dequantizes eight consecutive values of one q8_0 cache row
+/// (head `kvh`, dims [dim0, dim0 + 8) of a `per_head`-value head row;
+/// row stride `row_bytes`) into one 16-byte chunk of binary16, the
+/// staged-tile transport the WMMA kernel consumes. dim0 is a multiple
+/// of 8, so the eight values lie inside one 32-value q8_0 block and
+/// share its fp16 scale: value = int8 code * scale, rounded to
+/// binary16 -- the same dequantized tile the non-WMMA paths stage
+/// (KV-07/KV-09), so a prefill row computes what decode computes.
+__device__ __forceinline__ uint4 DequantQ8Chunk(
+    const std::uint8_t* cache_q8, std::size_t row_bytes, std::uint32_t slot,
+    std::uint32_t kvh, std::uint32_t per_head, std::uint32_t dim0) {
+  const std::uint8_t* block =
+      cache_q8 + static_cast<std::size_t>(slot) * row_bytes +
+      (static_cast<std::size_t>(kvh) * (per_head / 32) + dim0 / 32) * 34;
+  const __half scale = *reinterpret_cast<const __half*>(block + 32);
+  const std::uint8_t* codes = block + dim0 % 32;
+  union {
+    uint4 u;
+    __half h[8];
+  } cvt;
+  // The product rounds once either way: a code is exact in binary16
+  // and in FP32, the scale is a binary16 value, and their exact
+  // product (at most 18 mantissa bits) rounds to binary16 identically
+  // in both arithmetics -- so the staged tile is bit-for-bit the one
+  // the FP32 dequant paths stage, at half the conversion cost.
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    cvt.h[i] = __hmul(
+        __int2half_rn(static_cast<int>(static_cast<std::int8_t>(codes[i]))),
+        scale);
+  }
+  return cvt.u;
+}
+
 __device__ __forceinline__ v16h LoadFrag(const __half* p) {
   union {
     v16h f;
@@ -118,7 +152,7 @@ __device__ __forceinline__ float SegmentReduce(float v, Op op) {
 /// dims are staged from the value registers and only the rotated dims come
 /// from the K cache, which frees the registers two blocks per WGP need.
 template<std::uint32_t D, std::uint32_t kHeads, std::uint32_t kQueryBlocks,
-         bool kGlobal>
+         bool kGlobal, bool kQ8 = false>
 __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
     __attribute__((amdgpu_waves_per_eu(kGlobal || D == 256 ? 8 : 1)))
     WmmaPrefillAttentionKernel(AttentionArgs a) {
@@ -230,6 +264,13 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   const std::size_t kv_stride = static_cast<std::size_t>(a.kv_heads) * D;
   const auto* k_cache = reinterpret_cast<const __half*>(a.k_cache);
   const auto* v_cache = reinterpret_cast<const __half*>(a.v_cache);
+  // KV-12: q8_0 row strides (all KV heads) for the dequant-tile stage:
+  // the K/V rows proper, and the packed rotated-dims row of a global
+  // layer (2 * kGlobalPairs values per head).
+  const std::size_t row_bytes_q8 =
+      static_cast<std::size_t>(a.kv_heads) * (D / 32) * 34;
+  const std::size_t rot_row_bytes_q8 =
+      static_cast<std::size_t>(a.kv_heads) * (2 * kGlobalPairs / 32) * 34;
   const auto slot_of = [&](std::uint32_t key) {
     return a.ring != 0 ? key % a.ring : key;
   };
@@ -297,6 +338,24 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   const auto fetch = [&](std::uint32_t key0) {
     if constexpr (kGlobal) {
       if (key0 + kKeys <= block_hi) {
+        if constexpr (kQ8) {
+          // KV-12: the tile's values and rotated key dims dequantize
+          // from the q8_0 stores (global layers have ring == 0, so a
+          // key IS its slot). chunk_key(0) / chunk_d8(0) name this
+          // thread's key and 8 dims, as in the binary16 road.
+          const std::uint32_t key_a = key0 + chunk_key(0);
+          const std::uint32_t d8 = chunk_d8(0);
+          v_next[0] =
+              DequantQ8Chunk(a.v_cache_q8, row_bytes_q8, key_a, kv_head, D, d8);
+          v_next[1] = DequantQ8Chunk(a.v_cache_q8, row_bytes_q8, key_a + 1,
+                                     kv_head, D, d8);
+          if (rot_wave) {
+            k_rot = DequantQ8Chunk(a.k_cache_q8, rot_row_bytes_q8,
+                                   key0 + tid % kKeys, kv_head,
+                                   2 * kGlobalPairs, (tid / kKeys) * 8);
+          }
+          return;
+        }
         const std::uint32_t v_at = v_offset + key0 * v_row_bytes;
         v_next[0] = *at(v_head, v_at);
         v_next[1] = *at(v_head, v_at + v_row_bytes);
@@ -317,23 +376,44 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
       if (position < block_hi) {
         const std::size_t slot = slot_of(position);
         if constexpr (!kGlobal) {
-          k_next[j] = *reinterpret_cast<const uint4*>(key_base[j] +
-                                                      slot * key_stride[j]);
+          if constexpr (kQ8) {
+            // KV-12: dequantize this chunk of the q8_0 K row. The
+            // launcher declines q8_0 derived keys outside the global
+            // template, so here rope_pairs == 0 and the K row is the
+            // plain per-head row QkvPost wrote (KV-05).
+            k_next[j] = DequantQ8Chunk(a.k_cache_q8, row_bytes_q8,
+                                       static_cast<std::uint32_t>(slot),
+                                       kv_head, D, d8);
+          } else {
+            k_next[j] = *reinterpret_cast<const uint4*>(key_base[j] +
+                                                        slot * key_stride[j]);
+          }
         }
-        v_next[j] = *reinterpret_cast<const uint4*>(
-            v_cache + slot * kv_stride + static_cast<std::size_t>(kv_head) * D +
-            d8);
+        if constexpr (kQ8) {
+          v_next[j] =
+              DequantQ8Chunk(a.v_cache_q8, row_bytes_q8,
+                             static_cast<std::uint32_t>(slot), kv_head, D, d8);
+        } else {
+          v_next[j] = *reinterpret_cast<const uint4*>(
+              v_cache + slot * kv_stride +
+              static_cast<std::size_t>(kv_head) * D + d8);
+        }
       }
     }
     if constexpr (kGlobal) {
       const std::uint32_t position = key0 + tid % kKeys;
       k_rot = make_uint4(0U, 0U, 0U, 0U);
       if (rot_wave && position < block_hi) {
-        k_rot = *reinterpret_cast<const uint4*>(
-            k_cache +
-            (static_cast<std::size_t>(position) * a.kv_heads + kv_head) * 2 *
-                kGlobalPairs +
-            (tid / kKeys) * 8);
+        if constexpr (kQ8) {
+          k_rot = DequantQ8Chunk(a.k_cache_q8, rot_row_bytes_q8, position,
+                                 kv_head, 2 * kGlobalPairs, (tid / kKeys) * 8);
+        } else {
+          k_rot = *reinterpret_cast<const uint4*>(
+              k_cache +
+              (static_cast<std::size_t>(position) * a.kv_heads + kv_head) * 2 *
+                  kGlobalPairs +
+              (tid / kKeys) * 8);
+        }
       }
     }
   };
@@ -597,7 +677,7 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
 }
 
 template<std::uint32_t D, std::uint32_t kHeads, std::uint32_t kQueryBlocks>
-bool Launch(const AttentionArgs& a, hipStream_t stream) {
+bool Launch(const AttentionArgs& a, hipStream_t stream, bool q8) {
   if ((a.heads / a.kv_heads) % kHeads != 0) {
     return false;
   }
@@ -612,13 +692,29 @@ bool Launch(const AttentionArgs& a, hipStream_t stream) {
         a.key_ends == nullptr &&
         keys * a.kv_heads * D * sizeof(__half) <=
             std::numeric_limits<std::uint32_t>::max()) {
-      WmmaPrefillAttentionKernel<D, kHeads, kQueryBlocks, true>
-          <<<grid, kThreads, 0, stream>>>(a);
+      if (q8) {
+        WmmaPrefillAttentionKernel<D, kHeads, kQueryBlocks, true, true>
+            <<<grid, kThreads, 0, stream>>>(a);
+      } else {
+        WmmaPrefillAttentionKernel<D, kHeads, kQueryBlocks, true, false>
+            <<<grid, kThreads, 0, stream>>>(a);
+      }
       return true;
     }
   }
-  WmmaPrefillAttentionKernel<D, kHeads, kQueryBlocks, false>
-      <<<grid, kThreads, 0, stream>>>(a);
+  if (q8 && a.rope_pairs != 0) {
+    // KV-12: derived keys over q8_0 are taken only by the global
+    // template above; any other derived shape declines to the
+    // KV-11 non-WMMA road, which reconstructs them exactly.
+    return false;
+  }
+  if (q8) {
+    WmmaPrefillAttentionKernel<D, kHeads, kQueryBlocks, false, true>
+        <<<grid, kThreads, 0, stream>>>(a);
+  } else {
+    WmmaPrefillAttentionKernel<D, kHeads, kQueryBlocks, false, false>
+        <<<grid, kThreads, 0, stream>>>(a);
+  }
   return true;
 }
 
@@ -628,15 +724,26 @@ bool LaunchWmmaPrefillAttention(const AttentionArgs& a, hipStream_t stream) {
   if (a.kv_heads == 0 || a.heads % a.kv_heads != 0) {
     return false;
   }
+  // KV-12: a q8_0 cache takes the WMMA road through the kernel's
+  // dequant-tile stage when the shape is one it stages exactly:
+  // plain layers at either head_dim, and derived-key layers only in
+  // the global template's shape (checked again in Launch). Shapes
+  // with siblings, a shared position, or a live activation pack keep
+  // the KV-11 non-WMMA road, as do q8_0 caches without their V store.
+  const bool q8 = a.k_cache_q8 != nullptr;
+  if (q8 && (a.v_cache_q8 == nullptr || a.siblings != 0 || a.shared_position ||
+             a.pack.hi != nullptr)) {
+    return false;
+  }
   if (a.head_dim == 256) {
     // Two heads x four 16-query blocks, two waves per row block: the
     // staged window serves 128 rows (the kernel is bound by its K/V
     // traffic), and 192 VGPRs keep two blocks per WGP.
-    return Launch<256, 2, 4>(a, stream);
+    return Launch<256, 2, 4>(a, stream, q8);
   }
   if (a.head_dim == 512) {
     // Four heads x one 16-query block, four waves per row block.
-    return Launch<512, 4, 1>(a, stream);
+    return Launch<512, 4, 1>(a, stream, q8);
   }
   return false;
 }

@@ -82,7 +82,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-09 global layers derived-K | DONE | section below; reconstruction max_abs_err 0.015822, SNR 47.14 dB; probes byte-identical to f16 |
 | KV-10 global validation gate | DONE | section below; Phase 4 gate PASSED; probes identical excl load timing; matrix kv10-q8 vs kv10-f16 recorded |
 | KV-11 non-WMMA prefill q8_0 | DONE | section below; probes byte-identical q8 vs f16; pp4096 +40.7 pct, pp16384 +103.8 pct vs KV-10 q8 |
-| KV-12 WMMA prefill / dispatch rule | PENDING | |
+| KV-12 WMMA prefill / dispatch rule | IMPLEMENTED, GATE OPEN | section below; WMMA dequant-tile stage landed, probes byte-identical; pp16384 -2.98 pct vs f16 is real, beyond noise -- Phase 5 gate not yet passed |
 | KV-13 machinery re-proof | PENDING | |
 | KV-14 full-stack integration | PENDING | |
 | KV-15 resident service re-proof | PENDING | |
@@ -560,6 +560,63 @@ per context size, crossover measured); the Phase 5 gate
 (prefill matrix vs the matrix-core f16 baseline, no regression
 beyond noise) is decided there.
 
+## Phase 5 gate slice (KV-12) -- WMMA prefill dequant-tile stage
+
+What landed (working tree built and measured 2026-11-17 by the
+prior builder; collected, verified and banked by the 11:54
+keeper tick -- no lock and no live bench at collection, the
+10:43 lock was stale, matrices had finished 11:52):
+- `hip/attention_wmma.hip.cpp` + `.hpp`: the WMMA matrix-core
+  prefill kernel gains a q8_0 dequant-tile stage -- each K/V
+  tile dequantizes once into LDS binary16 and feeds the matrix
+  cores, exactly the tile the f16 road stages. Shapes the stage
+  does not stage exactly return false.
+- `hip/kernels.hip.cpp` LaunchAttention: at prefill widths a
+  q8_0 layer tries the WMMA dequant-tile road first; a declined
+  shape falls through to the KV-11 split-kernel road.
+- `hip/executor.cpp`: a q8_0 layer at prefill widths again keeps
+  the null FP32 output for a binary16-only output projection
+  (the WMMA road writes the binary16 copy directly, like f16);
+  the non-WMMA fallback throws for its FP32 output there,
+  exactly as the f16 fallback does.
+
+Verification (2026-11-17, device; binary result ->
+/nix/store/g2mwszad...-gufo-0-unstable-4938016, built from
+this tree 11:34; MemAvailable ~124 GiB at both runs):
+- clang-format clean on all four touched files (keeper
+  re-checked). Standalone compile of the registered
+  kv_cache_format test -> PASS, numbers unchanged (K 0.010000 /
+  48.25 dB, V 0.010000 / 48.15 dB, ring 0.006234, derived-K
+  0.015822 / 47.14 dB).
+- Probes (full harness, labels kv12-q8 / kv12-f16, results
+  device-side): all five answers byte-identical q8_0 vs
+  same-binary f16 -- FACT-1 Paris, FACT-2 Au, FACT-3 366,
+  COH-1 identical text, LONG-1 47-12-89. The .err diffs are
+  only the expected kv-cache-type report line and timestamps.
+- Prefill matrix medians (tok/s, 5 runs, 1 warmup discarded),
+  KV-12 binary, q8_0 vs same-binary f16 (KV-11 q8 in parens):
+  pp512 2208.62 vs 2192.60 (+0.73 pct; KV-11 q8 1610.81),
+  pp4096 2884.23 vs 2918.58 (-1.18 pct; KV-11 q8 1447.54),
+  pp16384 2448.47 vs 2523.66 (-2.98 pct; KV-11 q8 1088.75).
+  The WMMA stage closes almost all of the KV-11 gap
+  (-26.8 / -50.4 / -56.9 pct at KV-11). Decode unchanged in
+  family: tg512 37.98 vs 42.08, tg4096 36.77 vs 40.59,
+  tg16384 35.44 vs 39.31 (the ~-9.5 pct global-q8 decode cost
+  recorded at KV-10; decode is not this phase gate).
+- Gate call, recorded honestly: intra-run spread on pp16384
+  is under 0.4 pct on both labels, so the -2.98 pct at 16k is
+  a REAL small regression, not noise. The Phase 5 gate text
+  (no regression beyond noise vs the matrix-core f16
+  baseline) is therefore NOT yet passed. pp512 and pp4096
+  are within ~1 pct. Installed profile and
+  gufo-resident.service untouched; Ollama (:11434) untouched.
+
+Next: close the pp16384 gap (dequant-tile staging cost at
+long context is the named suspect) and re-run the pp16384
+pair; the Phase 5 gate is decided on that evidence. KV-13
+(Phase 6 machinery re-proof) does not start until the gate
+call is made.
+
 ## Phase gates
 
 - Phase 0 gate: PASSED 2026-11-17 — harness committed (KV-01),
@@ -568,6 +625,7 @@ beyond noise) is decided there.
 - Phase 2 gate: PASSED 2026-11-17 — evidence in the KV-06 section above.
 - Phase 3 gate: PASSED 2026-11-17 -- evidence in the KV-08 section above.
 - Phase 4 gate: PASSED 2026-11-17 -- evidence in the KV-10 section above.
+- Phase 5 gate: OPEN -- KV-12 evidence in the section above (pp16384 -2.98 pct, real).
 
 ## Phase 1 (KV-03 + KV-04) — format field, allocation, plumbing
 

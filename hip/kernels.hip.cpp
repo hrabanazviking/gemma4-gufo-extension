@@ -1866,6 +1866,15 @@ void LaunchAttention(const AttentionArgs& a, hipStream_t stream) {
   constexpr std::uint32_t kGroup = D == 256 ? 2 : 8;
   if (a.rows > kSplitRows) {
     if (a.k_cache_q8 != nullptr) {
+      // KV-12: the WMMA matrix-core prefill takes a q8_0 cache first,
+      // through its dequant-tile stage (hip/attention_wmma.hip.cpp):
+      // each K/V tile dequantizes once into LDS binary16 and feeds
+      // the matrix cores, exactly the tile the f16 road stages. A
+      // shape the WMMA stage declines falls through to the KV-11
+      // road below.
+      if (LaunchWmmaPrefillAttention(a, stream)) {
+        return;
+      }
       // KV-11: non-WMMA prefill over a q8_0 cache. The rows run
       // through the split kernel in kSplitRows-row blocks: its
       // staged tiles dequantize each q8_0 cache tile once for the
@@ -1877,10 +1886,9 @@ void LaunchAttention(const AttentionArgs& a, hipStream_t stream) {
       // prefill row computes exactly what the decode path
       // computes for it -- the KV-07/KV-09 read paths, derived-key
       // reconstruction included. Prefill writes already quantize
-      // in QkvPost (KV-05/KV-06/KV-09) at every width. The WMMA
-      // prefill kernel reads binary16 tiles only; a q8_0 WMMA
-      // dequant-tile stage or a dispatch rule between the two
-      // prefill paths is KV-12.
+      // in QkvPost (KV-05/KV-06/KV-09) at every width. This road
+      // remains the fallback for shapes the KV-12 WMMA dequant-tile
+      // stage declines.
       if (a.out == nullptr) {
         throw std::invalid_argument("this attention needs its FP32 output");
       }

@@ -1016,16 +1016,15 @@ void Executor::Forward(std::span<const Segment> segments,
       att.q = q_ + std::size_t{row0} * c.QDim(l);
       att.k_cache = cache.k[l];
       att.v_cache = cache.v[l];
-      // KV-07/KV-11: a q8_0 layer at prefill widths takes the
-      // non-WMMA path in LaunchAttention, which needs its FP32
-      // output; the binary16 copy the prefill projection consumes
-      // is narrowed from it there. Other layers keep the WMMA
-      // route's null FP32 output when the output projection is
-      // binary16-only.
-      att.out =
-          half_only({&L.attn_output}) && cache.format != KvCacheFormat::kQ8_0
-              ? nullptr
-              : attn_ + std::size_t{row0} * c.QDim(l);
+      // KV-12: a q8_0 layer at prefill widths takes the WMMA path
+      // in LaunchAttention, which writes the binary16 copy directly
+      // like the f16 route, so a binary16-only output projection
+      // keeps the null FP32 output. The KV-11 non-WMMA fallback for
+      // shapes the WMMA stage declines needs the FP32 output and
+      // throws for it there, exactly as the f16 fallback does.
+      att.out = half_only({&L.attn_output})
+                    ? nullptr
+                    : attn_ + std::size_t{row0} * c.QDim(l);
       att.partials = partials_;
       att.rows = seg.rows;
       att.heads = c.num_heads;
