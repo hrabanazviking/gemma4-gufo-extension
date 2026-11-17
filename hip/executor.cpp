@@ -417,15 +417,16 @@ std::unique_ptr<KvCache> Executor::CreateCache(std::uint32_t max_context,
   }
   if (kv_format_ != KvCacheFormat::kF16) {
     // Phase 1 of the KV campaign: the format is parsed, reported and
-    // sized (CacheBytes), but the quantized write/read paths are not
-    // built yet. Refuse loudly rather than serve a cache whose rows
-    // no consumer can read.
+    // sized (CacheBytes) and the quantized write paths are built
+    // (KV-05/KV-06), but the decode read path is not (KV-07). Refuse
+    // loudly rather than serve a cache whose rows no consumer can
+    // read.
     if (error_msg != nullptr) {
       *error_msg = "KV cache format '" +
                    std::string(KvCacheFormatName(kv_format_)) +
                    "' is not built yet (KV campaign: K quantize-on-"
-                   "write landed in KV-05; V store and decode read "
-                   "paths land in KV-06/KV-07); use f16";
+                   "write landed in KV-05, V store in KV-06; the "
+                   "decode read path lands in KV-07); use f16";
     }
     return nullptr;
   }
@@ -967,13 +968,16 @@ void Executor::Forward(std::span<const Segment> segments,
       post.freq_factors = sliding ? nullptr : model_.rope_factors();
       post.k_cache = cache.k[l];
       post.v_cache = cache.v[l];
-      // KV-05: sliding layers store K as q8_0 when the cache format
-      // says so. Unreachable today -- CreateCache still refuses q8_0
-      // until the V store (KV-06) and the decode read path (KV-07)
-      // land -- so f16 behavior is unchanged; the wiring is in place
-      // for the slice that lifts the refusal.
+      // KV-05/KV-06: sliding layers store K and V as q8_0 when the
+      // cache format says so. Unreachable today -- CreateCache still
+      // refuses q8_0 until the decode read path (KV-07) lands -- so
+      // f16 behavior is unchanged; the wiring is in place for the
+      // slice that lifts the refusal.
       post.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
                             ? reinterpret_cast<std::uint8_t*>(cache.k[l])
+                            : nullptr;
+      post.v_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+                            ? reinterpret_cast<std::uint8_t*>(cache.v[l])
                             : nullptr;
       post.rows = seg.rows;
       post.heads = c.num_heads;

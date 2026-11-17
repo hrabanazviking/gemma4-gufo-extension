@@ -585,11 +585,40 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
   }
   load(a.v + row * v_row + std::size_t{kvh} * D, v);
   norm_rope(v, nullptr, false);
+  if (a.v_cache_q8 != nullptr && pairs == 0) {
+    // KV-06: q8_0 V store, the same block layout and slot/ring
+    // addressing as the KV-05 K store above: one 32-value block lies
+    // in one wave, WaveMax gives the block amax, each lane writes its
+    // own code, lane 0 writes the fp16 scale. Matches
+    // QuantizeQ8_0Row on the host.
+    const std::size_t row_bytes =
+        (static_cast<std::size_t>(a.kv_heads) * D / 32) * 34;
+    std::uint8_t* row_q8 =
+        a.v_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+    constexpr std::uint32_t kBlocksPerHead = D / 32;
 #pragma unroll
-  for (int w = 0; w < kWaves; ++w) {
+    for (int w = 0; w < kWaves; ++w) {
 #pragma unroll
-    for (int k = 0; k < K; ++k) {
-      v_cache[cache + dim_of(w, k)] = __float2half(v[w][k]);
+      for (int k = 0; k < K; ++k) {
+        const std::uint32_t blk = kvh * kBlocksPerHead + w + kWaves * k;
+        std::uint8_t* out = row_q8 + static_cast<std::size_t>(blk) * 34;
+        const float amax = WaveMax(fabsf(v[w][k]));
+        const float dscale = amax / 127.0F;
+        const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
+        out[lane] = static_cast<std::uint8_t>(
+            static_cast<std::int8_t>(roundf(v[w][k] * inv)));
+        if (lane == 0) {
+          *reinterpret_cast<__half*>(out + 32) = __float2half(dscale);
+        }
+      }
+    }
+  } else {
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w) {
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        v_cache[cache + dim_of(w, k)] = __float2half(v[w][k]);
+      }
     }
   }
 }

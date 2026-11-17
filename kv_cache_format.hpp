@@ -152,7 +152,7 @@ inline constexpr std::uint32_t kQ8_0BlockBytes = 34;
 /// Quantizes one 32-value block into `out` (34 bytes): 32 int8 codes
 /// followed by the fp16 scale (little-endian, ggml q8_0 layout).
 /// scale = max|v| / 127; a zero block stores a zero scale and codes.
-/// This is the host reference for the QkvPost device store (KV-05);
+/// This is the host reference for the QkvPost device stores (KV-05/KV-06);
 /// the kernel computes the same values (its scale passes through
 /// __float2half, which may differ by at most the fp16 rounding the
 /// host conversion also applies).

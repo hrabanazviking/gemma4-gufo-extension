@@ -202,6 +202,124 @@ void CheckQ8KRowRoundtrip() {
   Require(snr_db >= 30.0, "q8_0 K roundtrip SNR too low");
 }
 
+// KV-06 gate evidence, V half: a sliding-layer V row (2048 values)
+// through the same host reference the QkvPost V store mirrors.
+// Different seed, range and outlier block (41, amax 6) from the K
+// test so the two halves are independent measurements.
+void CheckQ8VRowRoundtrip() {
+  constexpr std::size_t kValues = 2048;
+  std::vector<float> row(kValues);
+  std::uint32_t state = 0x9E3779B9U;
+  for (std::size_t i = 0; i < kValues; ++i) {
+    state = state * 1664525U + 1013904223U;
+    const float u = static_cast<float>(state >> 8) / 16777216.0F;
+    row[i] = u * 4.0F - 2.0F;
+  }
+  for (std::size_t i = 41 * 32; i < 42 * 32; ++i) {
+    row[i] = 0.01F;
+  }
+  row[41 * 32] = -6.0F;
+  std::vector<std::uint8_t> packed(
+      g4::KvCacheRowBytes(2048, g4::KvCacheFormat::kQ8_0));
+  Require(packed.size() == 2176, "q8_0 V row is not 2176 bytes");
+  g4::QuantizeQ8_0Row(row, packed.data());
+  std::vector<float> back(kValues);
+  g4::DequantizeQ8_0Row(packed.data(), back.data(), kValues);
+  double max_abs = 0.0;
+  double max_abs_calm = 0.0;
+  double sig = 0.0;
+  double err = 0.0;
+  for (std::size_t i = 0; i < kValues; ++i) {
+    const double e = std::fabs(static_cast<double>(back[i]) - row[i]);
+    max_abs = std::max(max_abs, e);
+    if (i / 32 != 41) {
+      max_abs_calm = std::max(max_abs_calm, e);
+    }
+    sig += static_cast<double>(row[i]) * row[i];
+    err += e * e;
+  }
+  const double snr_db = 10.0 * std::log10(sig / err);
+  std::printf(
+      "q8_0 V-row roundtrip: max_abs_err=%.6f "
+      "max_abs_err_calm_blocks=%.6f snr_db=%.2f\n",
+      max_abs, max_abs_calm, snr_db);
+  Require(max_abs <= 0.04, "q8_0 V roundtrip max abs error too large");
+  Require(max_abs_calm <= 0.012,
+          "q8_0 V error leaked outside the outlier block");
+  Require(snr_db >= 30.0, "q8_0 V roundtrip SNR too low");
+}
+
+// KV-06 ring-layout proof (host reference): rows are stored exactly
+// as QkvPost addresses them -- slot = position % ring, row bytes
+// from KvCacheRowBytes -- across two full ring wraps. Every slot
+// must roundtrip its LAST writer, and a constant row written at a
+// wrapped position must land at the exact byte offsets of its slot
+// (codes at slot*row_bytes + block*34, scale at +32) with the
+// neighbouring slots untouched.
+void CheckQ8RingLayout() {
+  constexpr std::uint32_t kRing = 8;
+  constexpr std::size_t kValues = 2048;
+  const std::size_t row_bytes =
+      g4::KvCacheRowBytes(2048, g4::KvCacheFormat::kQ8_0);
+  Require(row_bytes == 2176, "ring test row bytes wrong");
+  const auto make_row = [](std::uint32_t pos) {
+    std::vector<float> row(kValues);
+    std::uint32_t state = 0x85EBCA6BU + pos * 0x27D4EB2FU;
+    for (std::size_t i = 0; i < kValues; ++i) {
+      state = state * 1664525U + 1013904223U;
+      const float u = static_cast<float>(state >> 8) / 16777216.0F;
+      row[i] = u * 3.0F - 1.5F;
+    }
+    return row;
+  };
+  std::vector<std::uint8_t> cache(kRing * row_bytes, 0);
+  std::vector<std::vector<float>> last(kRing);
+  for (std::uint32_t pos = 0; pos < 20; ++pos) {
+    const std::uint32_t slot = pos % kRing;
+    std::vector<float> row = make_row(pos);
+    g4::QuantizeQ8_0Row(row, cache.data() + slot * row_bytes);
+    last[slot] = row;
+  }
+  double max_abs = 0.0;
+  std::vector<float> back(kValues);
+  for (std::uint32_t slot = 0; slot < kRing; ++slot) {
+    g4::DequantizeQ8_0Row(cache.data() + slot * row_bytes, back.data(),
+                          kValues);
+    for (std::size_t i = 0; i < kValues; ++i) {
+      max_abs = std::max(
+          max_abs, std::fabs(static_cast<double>(back[i]) - last[slot][i]));
+    }
+  }
+  std::printf("q8_0 ring layout: slots=%u wraps=2 max_abs_err=%.6f\n", kRing,
+              max_abs);
+  // Row values are in [-1.5, 1.5]: per-block scale <= 1.5/127, so
+  // the roundtrip error stays under half a step plus fp16 rounding.
+  Require(max_abs <= 0.012, "ring-wrapped q8_0 rows roundtrip badly");
+  // Byte-offset pin on a fresh region: a constant 0.5 row stored at
+  // position kRing + 2 lands in slot 2; every block holds codes 127
+  // and the fp16 scale of 0.5/127 at block offset +32.
+  std::vector<std::uint8_t> pin(kRing * row_bytes, 0);
+  std::vector<float> flat(kValues, 0.5F);
+  const std::uint32_t wrapped_pos = kRing + 2;
+  g4::QuantizeQ8_0Row(flat, pin.data() + (wrapped_pos % kRing) * row_bytes);
+  const std::size_t base = 2 * row_bytes;
+  const auto want_scale = g4::FloatToFp16Bits(0.5F / 127.0F);
+  for (std::size_t blk = 0; blk < kValues / 32; ++blk) {
+    const std::size_t at = base + blk * 34;
+    for (int i = 0; i < 32; ++i) {
+      Require(pin[at + i] == 127, "ring pin: code not at its byte offset");
+    }
+    const auto scale_bits = static_cast<std::uint16_t>(
+        pin[at + 32] | (static_cast<std::uint16_t>(pin[at + 33]) << 8));
+    Require(scale_bits == want_scale, "ring pin: scale not at +32");
+  }
+  for (std::size_t i = 0; i < pin.size(); ++i) {
+    if (i < base || i >= base + row_bytes) {
+      Require(pin[i] == 0, "ring pin: write leaked into another slot");
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -212,5 +330,7 @@ int main() {
     CheckFp16Bits();
     CheckQ8BlockLayout();
     CheckQ8KRowRoundtrip();
+    CheckQ8VRowRoundtrip();
+    CheckQ8RingLayout();
   });
 }

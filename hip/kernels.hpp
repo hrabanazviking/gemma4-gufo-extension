@@ -50,8 +50,12 @@ struct QkvPostArgs {
   /// the row for slot s starts at k_cache_q8 + s * KvCacheRowBytes(
   /// kv_heads * head_dim, kQ8_0) and holds one 34-byte block per 32
   /// values in row order (per-head blocks contiguous). Only valid with
-  /// rotated_pairs == 0; V still stores binary16 in this slice (KV-06).
+  /// rotated_pairs == 0.
   std::uint8_t* k_cache_q8{nullptr};
+  /// Same for V rows (KV-06): when non-null (and rotated_pairs == 0),
+  /// V rows are stored q8_0 at v_cache_q8 + s * KvCacheRowBytes(
+  /// kv_heads * head_dim, kQ8_0), the same block layout as K.
+  std::uint8_t* v_cache_q8{nullptr};
   std::uint32_t rows;
   std::uint32_t heads;
   std::uint32_t kv_heads;
