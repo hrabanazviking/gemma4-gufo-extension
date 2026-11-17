@@ -252,9 +252,7 @@ public:
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
   [[nodiscard]] std::uint32_t max_rows() const noexcept { return max_rows_; }
   [[nodiscard]] std::uint32_t ring() const noexcept { return ring_; }
-  [[nodiscard]] KvCacheFormat kv_format() const noexcept {
-    return kv_format_;
-  }
+  [[nodiscard]] KvCacheFormat kv_format() const noexcept { return kv_format_; }
   [[nodiscard]] const std::vector<std::uint32_t>& key_widths() const noexcept {
     return key_widths_;
   }

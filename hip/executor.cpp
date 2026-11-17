@@ -432,9 +432,9 @@ std::unique_ptr<KvCache> Executor::CreateCache(std::uint32_t max_context,
   cache->max_context = max_context;
   cache->ring = ring_;
   cache->format = kv_format_;
-  cache->bytes = CacheBytes(c, max_context, ring_, key_widths_,
-                            model_.vocab_size(), draft_table_bytes(),
-                            kv_format_);
+  cache->bytes =
+      CacheBytes(c, max_context, ring_, key_widths_, model_.vocab_size(),
+                 draft_table_bytes(), kv_format_);
   if (hip::AllocateDevice(&cache->allocation, cache->bytes) != hipSuccess) {
     if (error_msg != nullptr) {
       *error_msg = "KV cache allocation failed (" +

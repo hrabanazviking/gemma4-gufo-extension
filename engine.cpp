@@ -369,10 +369,9 @@ std::size_t Model::ResidentBytes() const noexcept {
 }
 
 std::size_t Model::SessionBytes(std::uint32_t context) const noexcept {
-  return rocm::Executor::CacheBytes(config(), context, executor_->ring(),
-                                    executor_->key_widths(), VocabSize(),
-                                    executor_->draft_table_bytes(),
-                                    executor_->kv_format());
+  return rocm::Executor::CacheBytes(
+      config(), context, executor_->ring(), executor_->key_widths(),
+      VocabSize(), executor_->draft_table_bytes(), executor_->kv_format());
 }
 
 std::size_t Model::SessionRingSlots() const noexcept {

@@ -38,13 +38,11 @@ inline void ApplyProviderOptions(const ext::ParsedOptions& given,
   // on stderr once per model load; the unset default stays silent.
   // Invalid values throw naming the value and its source — never a
   // silent fallback.
-  if (const auto* type =
-          FindOption<std::string>(given, "--kv-cache-type")) {
+  if (const auto* type = FindOption<std::string>(given, "--kv-cache-type")) {
     try {
       options.kv_cache_format = ParseKvCacheType(*type);
     } catch (const std::invalid_argument& e) {
-      throw std::invalid_argument("--kv-cache-type: " +
-                                  std::string(e.what()));
+      throw std::invalid_argument("--kv-cache-type: " + std::string(e.what()));
     }
     std::cerr << "[gemma4] kv cache type: "
               << KvCacheFormatName(options.kv_cache_format)
@@ -65,7 +63,8 @@ inline void ApplyProviderOptions(const ext::ParsedOptions& given,
 
 /// The soft-token budget per image (`--image-tokens`, default 280). Throws
 /// std::invalid_argument for a budget the checkpoint does not support.
-[[nodiscard]] inline std::uint32_t ImageTokens(const ext::ParsedOptions& given) {
+[[nodiscard]] inline std::uint32_t ImageTokens(
+    const ext::ParsedOptions& given) {
   const auto* tokens = ext::FindOption<std::int64_t>(given, "--image-tokens");
   if (tokens == nullptr) {
     return vision::kDefaultSoftTokens;
