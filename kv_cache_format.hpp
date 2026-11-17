@@ -210,6 +210,17 @@ inline void DequantizeQ8_0Row(const std::uint8_t* in, float* row,
   }
 }
 
+/// The format one layer's regions use in a cache whose sliding
+/// layers are stored in `format`: global layers keep binary16 until
+/// the derived-K design lands (KV-09), so a q8_0 cache is a mixed
+/// cache -- sliding rows q8_0, global rows binary16. The write path
+/// (QkvPost), the allocation (Executor::CreateCache/CacheBytes) and
+/// every read path agree on this rule.
+[[nodiscard]] inline KvCacheFormat KvCacheLayerFormat(KvCacheFormat format,
+                                                      bool sliding) noexcept {
+  return sliding ? format : KvCacheFormat::kF16;
+}
+
 /// One layer's cache shape for storage sizing: `slots` rows of
 /// `key_values`-wide K and `v_values`-wide V.
 struct KvLayerShape {
@@ -239,6 +250,24 @@ inline constexpr std::size_t kKvCacheRegionAlign = 256;
                             KvCacheRowBytes(layer.key_values, format)) +
              KvCacheAlignUp(std::size_t{layer.slots} *
                             KvCacheRowBytes(layer.v_values, format));
+  }
+  return bytes;
+}
+
+/// Total K+V storage bytes for `layers` whose regions use the
+/// per-layer formats in `formats` (parallel to `layers`), each
+/// region aligned separately as the executor carves the allocation.
+/// With every format equal this reproduces KvCacheStorageBytes.
+[[nodiscard]] inline std::size_t KvCacheStorageBytesPerLayer(
+    std::span<const KvLayerShape> layers,
+    std::span<const KvCacheFormat> formats) {
+  std::size_t bytes = 0;
+  for (std::size_t i = 0; i < layers.size(); ++i) {
+    const KvLayerShape& layer = layers[i];
+    bytes += KvCacheAlignUp(std::size_t{layer.slots} *
+                            KvCacheRowBytes(layer.key_values, formats[i])) +
+             KvCacheAlignUp(std::size_t{layer.slots} *
+                            KvCacheRowBytes(layer.v_values, formats[i]));
   }
   return bytes;
 }

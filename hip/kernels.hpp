@@ -131,6 +131,15 @@ struct AttentionArgs {
   const float* q;
   const std::uint16_t* k_cache;  ///< binary16; rotated dims when derived
   const std::uint16_t* v_cache;  ///< binary16
+  /// When non-null (KV-07, sliding layers of a q8_0 cache only;
+  /// rope_pairs == 0), K rows are read from these q8_0 blocks with
+  /// in-kernel dequantization instead of the binary16 cache: the row
+  /// for slot s starts at k_cache_q8 + s * KvCacheRowBytes(
+  /// kv_heads * head_dim, kQ8_0), one 34-byte block per 32 values in
+  /// row order -- the layout QkvPost (KV-05) writes.
+  const std::uint8_t* k_cache_q8{nullptr};
+  /// Same for V rows (the KV-06 store).
+  const std::uint8_t* v_cache_q8{nullptr};
   float* out;
   float* partials;
   std::uint32_t rows;
@@ -224,9 +233,11 @@ void Softcap(float* logits, std::size_t count, float cap, hipStream_t stream);
 void GatherRows(const float* src, const std::uint32_t* index, float* dst,
                 std::uint32_t rows, std::uint32_t dim, hipStream_t stream);
 
-/// One session's K/V caches, every layer: copies the binary16 row of key
+/// One session's K/V caches, every layer: copies the stored row of key
 /// `from` over that of key `to` (keys at slot key % ring[l] where ring[l] >
-/// 0), widths in values per row.
+/// 0). Widths are in uint16 units of the STORED row: values per row for
+/// binary16 layers, KvCacheRowBytes(values, format) / 2 for q8_0 layers
+/// (KV-07), so the copy moves exactly the stored bytes of either format.
 struct MoveKeyArgs {
   static constexpr std::uint32_t kMaxLayers = 96;
   std::uint16_t* k[kMaxLayers];

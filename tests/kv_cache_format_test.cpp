@@ -320,6 +320,46 @@ void CheckQ8RingLayout() {
   }
 }
 
+// KV-07: the mixed cache the executor actually allocates in q8_0
+// mode -- sliding layers q8_0, global layers binary16 (KV-09 owns
+// the global design). Per token: 25 sliding x (2,304 + 2,304)
+// aligned q8_0 bytes + 5 global x (1,024 + 2,048) binary16 bytes
+// = 130,560 B, against 220,160 B all-f16 and 125,440 B for the
+// (never allocated) all-q8_0 figure pinned in CheckStorageBytes.
+void CheckMixedStorageBytes() {
+  using g4::KvCacheFormat;
+  Require(g4::KvCacheLayerFormat(KvCacheFormat::kQ8_0, true) ==
+              KvCacheFormat::kQ8_0,
+          "sliding layer does not take the cache format");
+  Require(g4::KvCacheLayerFormat(KvCacheFormat::kQ8_0, false) ==
+              KvCacheFormat::kF16,
+          "global layer is not kept binary16 in a q8_0 cache");
+  Require(
+      g4::KvCacheLayerFormat(KvCacheFormat::kF16, true) == KvCacheFormat::kF16,
+      "f16 cache layer format wrong");
+  std::vector<g4::KvLayerShape> model;
+  std::vector<KvCacheFormat> formats;
+  for (int i = 0; i < 25; ++i) {
+    model.push_back({1, 2048, 2048});
+    formats.push_back(KvCacheFormat::kQ8_0);
+  }
+  for (int i = 0; i < 5; ++i) {
+    model.push_back({1, 512, 1024});
+    formats.push_back(KvCacheFormat::kF16);
+  }
+  Require(g4::KvCacheStorageBytesPerLayer(model, formats) == 130560,
+          "mixed q8_0 model bytes/token wrong");
+  // Uniform formats through the per-layer road reproduce the
+  // uniform figures.
+  std::vector<KvCacheFormat> all_f16(model.size(), KvCacheFormat::kF16);
+  Require(g4::KvCacheStorageBytesPerLayer(model, all_f16) == 220160,
+          "per-layer f16 bytes drifted from the KV-02 baseline");
+  std::vector<KvCacheFormat> all_q8(model.size(), KvCacheFormat::kQ8_0);
+  Require(g4::KvCacheStorageBytesPerLayer(model, all_q8) ==
+              g4::KvCacheStorageBytes(model, KvCacheFormat::kQ8_0),
+          "per-layer q8_0 bytes differ from the uniform road");
+}
+
 }  // namespace
 
 int main() {
@@ -327,6 +367,7 @@ int main() {
     CheckParse();
     CheckRowBytes();
     CheckStorageBytes();
+    CheckMixedStorageBytes();
     CheckFp16Bits();
     CheckQ8BlockLayout();
     CheckQ8KRowRoundtrip();

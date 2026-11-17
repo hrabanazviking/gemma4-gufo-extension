@@ -77,7 +77,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-04 GUFO_KV_CACHE_TYPE plumbing | DONE | f427c09 + format fix 5f59d2e; section below |
 | KV-05 quantize-on-write K (sliding) | DONE | section below; roundtrip max_abs_err 0.010000, SNR 48.25 dB |
 | KV-06 quantize-on-write V + ring | DONE | section below; V roundtrip max_abs_err 0.010000, SNR 48.15 dB; ring max_abs_err 0.006234 |
-| KV-07 dequant-in-decode (sliding) | PENDING | |
+| KV-07 dequant-in-decode (sliding) | DONE | section below; q8_0 probes FACT-1/2/3 + LONG-1 identical to the f16 baseline |
 | KV-08 decode correctness + speed gate | PENDING | |
 | KV-09 global layers derived-K | PENDING | |
 | KV-10 global validation gate | PENDING | |
@@ -249,6 +249,78 @@ V: max 0.010000, calm 0.008249, SNR 48.15 dB; ring rows max
 bf16 in q8_0 mode. Next (KV-07): the decode read path
 (dequant-in-decode for sliding layers), which is what may lift
 the CreateCache refusal.
+
+## Phase 3 first slice (KV-07) -- dequant-in-decode, sliding
+
+What landed:
+- `hip/kernels.hpp`: `AttentionArgs` gains `k_cache_q8` /
+  `v_cache_q8`, mirroring `QkvPostArgs` -- set only for sliding
+  layers of a q8_0 cache (never with derived keys).
+- `hip/kernels.hip.cpp`: in-kernel dequantization on every decode
+  read path for sliding layers. `DequantQ8Lane` (value = int8 code
+  x fp16 block scale; a lane's P values always lie in one 32-value
+  block) serves the single-pass `AttendKeys` (dequantizes to FP32)
+  and the split-K kernel's own-key step. The split-K `load()`
+  dequantizes into its binary16 transport, so the score/value
+  loops consume q8_0 rows exactly as f16 rows (dequantized values
+  land at the cache's native binary16 precision there). At
+  prefill widths a q8_0 sliding layer takes the single-pass
+  kernel instead of the WMMA kernel, which reads binary16 tiles
+  (the WMMA dequant-tile stage is KV-12); the executor gives that
+  call its FP32 output and the existing narrow step fills the
+  binary16 copy the prefill projection consumes.
+- Mixed cache, made explicit: `KvCacheLayerFormat` in
+  `kv_cache_format.hpp` -- sliding layers take the cache format,
+  global layers stay binary16 until KV-09. `CacheBytes` and the
+  `CreateCache` carve both size per layer through it (new
+  `KvCacheStorageBytesPerLayer`); at 1 slot the mixed figure is
+  130,560 B/token (25 sliding q8_0 + 5 global f16), pinned in the
+  extended `gemma4.kv_cache_format` test. This also fixes the
+  Phase 1 sizing, which would have carved global regions at q8_0
+  sizes under their binary16 stores. `CreateCache` no longer
+  refuses q8_0; q4_0 stays a named reserved refusal.
+- `hip/executor.cpp`: Forward and DraftChains pass the q8_0
+  pointers for sliding layers (draft attention reads the shared
+  source layer). `MoveKey` now copies the STORED row -- widths in
+  uint16 units of stored bytes (KvCacheRowBytes / 2) -- so a
+  sibling commit moves a q8_0 row's exact 2,176 bytes; binary16
+  layers move exactly what they moved before.
+- NOT in this slice, by the roadmap's own staging: continuation
+  snapshots still size rows binary16 (engine.cpp VisitBody /
+  SnapshotBytes) -- q8_0 sessions must not be snapshotted until
+  KV-13 re-proves that machinery; the WMMA prefill dequant-tile
+  stage is KV-12; the Phase 3 gate (probe/logit comparison +
+  decode matrix vs baseline) is KV-08.
+
+Verification (2026-11-17, device):
+- Standalone compile of the registered test (g++ -std=c++20
+  -Wall -Wextra, headers only) -> PASS, including the new mixed
+  storage pins (130,560 B/token mixed; per-layer road reproduces
+  the uniform f16/q8_0 figures).
+- nix build of the KV-07 tree: clean (detached unit, ~4 min wall;
+  store path 8mk12m3f...-gufo-0-unstable-4938016). clang-format
+  clean on all touched files.
+- f16 spot check on the KV-07 binary: FACT-1 answers `Paris`,
+  identical to the KV-02 baseline.
+- q8_0 end to end on the KV-07 binary (`GUFO_KV_CACHE_TYPE=q8_0`,
+  full harness, results/kv07-q8/ device-side): FACT-1 `Paris`,
+  FACT-2 `Au`, FACT-3 `366`, LONG-1 `47-12-89` (15,739 prompt
+  tokens through serve) -- all byte-identical to the f16
+  baseline. COH-1 coherent and on-prompt, wording drifted from
+  the baseline (expected quantization drift on an open-ended
+  greedy path; the formal drift measurement is KV-08's gate).
+- Bench smoke (single run, NOT a gate measurement): q8_0 pp512
+  1851.89 t/s, tg32 42.14 t/s (f16 baseline tg128 @ ~512 ctx:
+  42.69). Prefill runs the single-pass sliding path until
+  KV-11/KV-12; decode is in the baseline's ballpark. The speed
+  gate itself is KV-08.
+- Error paths re-checked: env `bogus` -> named error; flag
+  `q4_0` -> reserved error. Installed profile and
+  gufo-resident.service untouched; Ollama (:11434) untouched.
+
+Next (KV-08): the Phase 3 gate -- probe set + logit comparison
+vs the Phase 0 reference and the decode matrix vs baseline at
+512 / 4k / 16k.
 
 ## Phase gates
 

@@ -207,13 +207,18 @@ std::size_t Executor::CacheBytes(const Config& c, std::uint32_t max_context,
                                  std::size_t draft_table_bytes,
                                  KvCacheFormat format) {
   std::vector<KvLayerShape> layers;
+  std::vector<KvCacheFormat> formats;
   layers.reserve(c.num_layers);
+  formats.reserve(c.num_layers);
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
     const std::uint32_t slots =
         c.IsSliding(l) ? std::min(ring, max_context) : max_context;
     layers.push_back(KvLayerShape{slots, key_widths[l], c.KvDim(l)});
+    // KV-07: a quantized cache is mixed -- sliding layers quantized,
+    // global layers binary16 until the derived-K design (KV-09).
+    formats.push_back(KvCacheLayerFormat(format, c.IsSliding(l)));
   }
-  return KvCacheStorageBytes(layers, format) +
+  return KvCacheStorageBytesPerLayer(layers, formats) +
          AlignUp(std::size_t{c.hidden_size} * sizeof(float)) +
          AlignUp(std::size_t{kSplitRows} * c.hidden_size * sizeof(float)) +
          AlignUp(std::size_t{vocab} * sizeof(float)) +
@@ -415,21 +420,21 @@ std::unique_ptr<KvCache> Executor::CreateCache(std::uint32_t max_context,
     }
     return nullptr;
   }
-  if (kv_format_ != KvCacheFormat::kF16) {
-    // Phase 1 of the KV campaign: the format is parsed, reported and
-    // sized (CacheBytes) and the quantized write paths are built
-    // (KV-05/KV-06), but the decode read path is not (KV-07). Refuse
-    // loudly rather than serve a cache whose rows no consumer can
-    // read.
+  if (kv_format_ == KvCacheFormat::kQ4_0) {
+    // q4_0 stays reserved: ParseKvCacheType already rejects it, and
+    // no write/read path exists. Refuse loudly, never silently.
     if (error_msg != nullptr) {
-      *error_msg = "KV cache format '" +
-                   std::string(KvCacheFormatName(kv_format_)) +
-                   "' is not built yet (KV campaign: K quantize-on-"
-                   "write landed in KV-05, V store in KV-06; the "
-                   "decode read path lands in KV-07); use f16";
+      *error_msg =
+          "KV cache format 'q4_0' is reserved and not "
+          "implemented; use f16 or q8_0";
     }
     return nullptr;
   }
+  // KV-07: q8_0 caches are served end to end. The cache is mixed:
+  // sliding layers store and read q8_0 (KV-05/KV-06 writes, KV-07
+  // decode reads); global layers stay binary16 until the derived-K
+  // design lands (KV-09). The carve below sizes every region by its
+  // own layer's format, exactly as CacheBytes accounts for it.
   auto cache = std::make_unique<KvCache>();
   cache->max_context = max_context;
   cache->ring = ring_;
@@ -449,10 +454,12 @@ std::unique_ptr<KvCache> Executor::CreateCache(std::uint32_t max_context,
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
     const std::size_t slots =
         c.IsSliding(l) ? std::min(ring_, max_context) : max_context;
+    const KvCacheFormat layer_format =
+        KvCacheLayerFormat(kv_format_, c.IsSliding(l));
     const std::size_t v_bytes =
-        AlignUp(slots * KvCacheRowBytes(c.KvDim(l), kv_format_));
+        AlignUp(slots * KvCacheRowBytes(c.KvDim(l), layer_format));
     cache->k.push_back(reinterpret_cast<std::uint16_t*>(at));
-    at += AlignUp(slots * KvCacheRowBytes(key_widths_[l], kv_format_));
+    at += AlignUp(slots * KvCacheRowBytes(key_widths_[l], layer_format));
     cache->v.push_back(reinterpret_cast<std::uint16_t*>(at));
     at += v_bytes;
   }
@@ -969,10 +976,7 @@ void Executor::Forward(std::span<const Segment> segments,
       post.k_cache = cache.k[l];
       post.v_cache = cache.v[l];
       // KV-05/KV-06: sliding layers store K and V as q8_0 when the
-      // cache format says so. Unreachable today -- CreateCache still
-      // refuses q8_0 until the decode read path (KV-07) lands -- so
-      // f16 behavior is unchanged; the wiring is in place for the
-      // slice that lifts the refusal.
+      // cache format says so; KV-07 reads them back in decode.
       post.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
                             ? reinterpret_cast<std::uint8_t*>(cache.k[l])
                             : nullptr;
@@ -995,7 +999,14 @@ void Executor::Forward(std::span<const Segment> segments,
       att.q = q_ + std::size_t{row0} * c.QDim(l);
       att.k_cache = cache.k[l];
       att.v_cache = cache.v[l];
-      att.out = half_only({&L.attn_output})
+      // KV-07: a q8_0 sliding layer at prefill widths takes the
+      // single-pass kernel (LaunchAttention), which needs its FP32
+      // output; the binary16 copy the prefill projection consumes
+      // is narrowed from it there. Other layers keep the WMMA
+      // route's null FP32 output when the output projection is
+      // binary16-only.
+      att.out = half_only({&L.attn_output}) &&
+                        !(cache.format == KvCacheFormat::kQ8_0 && sliding)
                     ? nullptr
                     : attn_ + std::size_t{row0} * c.QDim(l);
       att.partials = partials_;
@@ -1012,6 +1023,15 @@ void Executor::Forward(std::span<const Segment> segments,
       att.out_half =
           half ? static_cast<__half*>(x_half_) + std::size_t{row0} * c.QDim(l)
                : nullptr;
+      // KV-07: sliding layers of a q8_0 cache are read from their
+      // q8_0 blocks with in-kernel dequantization; global layers
+      // (and every f16 cache) keep the binary16 pointers above.
+      att.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+                           ? reinterpret_cast<std::uint8_t*>(cache.k[l])
+                           : nullptr;
+      att.v_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+                           ? reinterpret_cast<std::uint8_t*>(cache.v[l])
+                           : nullptr;
       att.siblings = post.siblings;
       att.spare_key = post.spare_key;
       att.pack = attn_pack;
@@ -1459,8 +1479,14 @@ void Executor::MoveKey(KvCache& cache, std::uint32_t from, std::uint32_t to) {
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
     args.k[l] = cache.k[l];
     args.v[l] = cache.v[l];
-    args.k_width[l] = key_widths_[l];
-    args.v_width[l] = c.KvDim(l);
+    // KV-07: widths are uint16 units of the stored row, so a q8_0
+    // sliding row moves its exact stored bytes (2176 B = 1088
+    // units), not its value count. For binary16 layers the figure
+    // is the value count, exactly as before.
+    const KvCacheFormat layer_format =
+        KvCacheLayerFormat(cache.format, c.IsSliding(l));
+    args.k_width[l] = KvCacheRowBytes(key_widths_[l], layer_format) / 2;
+    args.v_width[l] = KvCacheRowBytes(c.KvDim(l), layer_format) / 2;
     args.ring[l] = c.IsSliding(l) ? cache.ring : 0;
   }
   BeforeMutation(cache);
@@ -1631,6 +1657,16 @@ void Executor::DraftChains(std::span<DraftJob> jobs) {
         att.key_limit = position;  // committed keys only
         att.window = sliding ? c.sliding_window : 0;
         att.ring = sliding ? cache.ring : 0;
+        // KV-07: the shared source layer is read as q8_0 when it is a
+        // sliding layer of a q8_0 cache, as in Forward.
+        att.k_cache_q8 =
+            cache.format == KvCacheFormat::kQ8_0 && tc.IsSliding(source)
+                ? reinterpret_cast<std::uint8_t*>(cache.k[source])
+                : nullptr;
+        att.v_cache_q8 =
+            cache.format == KvCacheFormat::kQ8_0 && tc.IsSliding(source)
+                ? reinterpret_cast<std::uint8_t*>(cache.v[source])
+                : nullptr;
         DeriveKeys(att, source);
         Attention(att, stream_);
       }
