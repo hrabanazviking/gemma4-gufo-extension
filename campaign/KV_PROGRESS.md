@@ -617,6 +617,36 @@ pair; the Phase 5 gate is decided on that evidence. KV-13
 (Phase 6 machinery re-proof) does not start until the gate
 call is made.
 
+## KV-12b -- packed-load staging tweak (measured on the superseded design)
+
+Landed by the 12:04 keeper tick (its first builder dispatch
+stopped when a chunked patch transfer was removed mid-flight;
+the keeper worked the slice directly). NOTE: this was built
+and measured against the KV-12 staging design that the Phase
+5 REDO (above, 3ca9f6a) supersedes; it is banked as measured
+history and because DequantQ8Chunk carries into the redo's
+R2 arithmetic unchanged.
+- `hip/attention_wmma.hip.cpp` DequantQ8Chunk: the chunk's
+  eight int8 codes now come from ONE packed 8-byte load
+  (memcpy; q8_0 block starts are 34-byte multiples, not
+  8-aligned) instead of eight byte loads. Codes, scale and
+  products unchanged -- staged tiles bit-for-bit identical;
+  clang-format clean.
+- Verification (2026-11-17, device; binary result ->
+  /nix/store/kbwmhx1m...-gufo-0-unstable-4938016; MemAvailable
+  ~121 GiB): probes kv12b-q8 vs kv12b-f16 -- all five answers
+  identical, load-timing lines excluded (Paris / Au / 366 /
+  COH-1 same text / 47-12-89). Prefill medians (tok/s, 5
+  runs): pp512 2204.25 vs 2190.02 (+0.65 pct), pp4096
+  2912.51 vs 2895.29 (+0.59 pct, was -1.18), pp16384
+  2463.46 vs 2525.32 (-2.45 pct, was -2.98; run spreads
+  ~0.5 pct, so still real). Decode q8 unchanged in family
+  (37.93 / 36.76 / 35.46). Installed profile, resident
+  service and Ollama (:11434) untouched.
+- Standing: the old Phase 5 gate was not passed by this
+  tweak and the redo's raised gate now governs. Next per
+  the redo plan: R1 layout audit, then R2-global.
+
 ## Phase gates
 
 - Phase 0 gate: PASSED 2026-11-17 — harness committed (KV-01),
@@ -625,7 +655,7 @@ call is made.
 - Phase 2 gate: PASSED 2026-11-17 — evidence in the KV-06 section above.
 - Phase 3 gate: PASSED 2026-11-17 -- evidence in the KV-08 section above.
 - Phase 4 gate: PASSED 2026-11-17 -- evidence in the KV-10 section above.
-- Phase 5 gate: OPEN -- KV-12 evidence in the section above (pp16384 -2.98 pct, real).
+- Phase 5 gate: OPEN -- KV-12 evidence above (pp16384 -2.98 pct, real); KV-12b staging tweak measured -2.45 pct on the superseded design; the REDO gate (strictly faster at all sizes) governs from 3ca9f6a.
 
 ## Phase 1 (KV-03 + KV-04) — format field, allocation, plumbing
 

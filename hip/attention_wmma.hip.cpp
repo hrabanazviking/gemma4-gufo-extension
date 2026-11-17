@@ -58,7 +58,13 @@ __device__ __forceinline__ uint4 DequantQ8Chunk(
       cache_q8 + static_cast<std::size_t>(slot) * row_bytes +
       (static_cast<std::size_t>(kvh) * (per_head / 32) + dim0 / 32) * 34;
   const __half scale = *reinterpret_cast<const __half*>(block + 32);
-  const std::uint8_t* codes = block + dim0 % 32;
+  // KV-12b: one packed 8-byte load for the chunk's eight codes
+  // instead of eight byte loads (block starts are 34-byte
+  // multiples, so the load goes through memcpy and stays
+  // alignment-safe); codes, scale and products are unchanged,
+  // so the staged tile is bit-for-bit identical.
+  std::uint64_t packed;
+  __builtin_memcpy(&packed, block + dim0 % 32, sizeof(packed));
   union {
     uint4 u;
     __half h[8];
@@ -70,9 +76,9 @@ __device__ __forceinline__ uint4 DequantQ8Chunk(
   // the FP32 dequant paths stage, at half the conversion cost.
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    cvt.h[i] = __hmul(
-        __int2half_rn(static_cast<int>(static_cast<std::int8_t>(codes[i]))),
-        scale);
+    cvt.h[i] = __hmul(__int2half_rn(static_cast<int>(static_cast<std::int8_t>(
+                          static_cast<std::uint8_t>(packed >> (8 * i))))),
+                      scale);
   }
   return cvt.u;
 }
