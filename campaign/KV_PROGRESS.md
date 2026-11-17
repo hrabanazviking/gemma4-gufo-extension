@@ -30,8 +30,10 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
   `gemma4_tests`, ctest names `gemma4.<name>`). Core clone:
   `~/src/gufo-dev` (CMakePresets include `gpu-test`, `cpu-test`).
   The nix shipping build does not run them; the test road is a
-  core CMake preset build — exact preset/flags to be pinned down
-  in Phase 1 when the first test lands (KV-03).
+  core CMake preset build — still unpinned (Phase 1 update: the
+  first test, KV-03's kv_cache_format test, is registered there
+  and was verified by standalone compile; pinning the preset road
+  remains open work for the next builder).
 - **Model under test:** `/home/volmarr/models/gufo/gemma-4-26B-A4B-it-heretic.Q8_0.gguf`
   (SSD copy; sha256 1f2e89b8382fd2182ef3a7e15a5cf272722f767a8a08a58dd69ae36c52edbf1c).
   Env: GUFO_MODELS_DIR=/home/volmarr/models/gufo,
@@ -71,8 +73,8 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 |---|---|---|
 | KV-01 harness | DONE | campaign/kv-harness/ (run_matrix.sh, run_probes.sh, probes.txt) + this file |
 | KV-02 f16 baseline | DONE | table below; raw logs results/baseline-f16/ (device-side) |
-| KV-03 format field + allocation | PENDING | |
-| KV-04 GUFO_KV_CACHE_TYPE plumbing | PENDING | |
+| KV-03 format field + allocation | DONE | ff8cf4f; section below |
+| KV-04 GUFO_KV_CACHE_TYPE plumbing | DONE | f427c09 + format fix 5f59d2e; section below |
 | KV-05 quantize-on-write K (sliding) | PENDING | |
 | KV-06 quantize-on-write V + ring | PENDING | |
 | KV-07 dequant-in-decode (sliding) | PENDING | |
@@ -135,4 +137,63 @@ Harness lessons (paid for once, recorded so nobody pays twice):
 
 - Phase 0 gate: PASSED 2026-11-17 — harness committed (KV-01),
   baseline table + probe answers banked (KV-02).
-- Phase 1 gate: PENDING.
+- Phase 1 gate: PASSED 2026-11-17 — evidence below.
+
+## Phase 1 (KV-03 + KV-04) — format field, allocation, plumbing
+
+What landed:
+- `kv_cache_format.hpp` (new, header-only): `KvCacheFormat`
+  {kF16, kQ8_0, kQ4_0-reserved}, `KvCacheFormatName`,
+  `ParseKvCacheType` (invalid values throw naming the value;
+  q4_0 throws as reserved), `KvCacheRowBytes` (q8_0 = ggml blocks,
+  34 B per 32 values, tail padded), `KvCacheStorageBytes`
+  (per-region 256 B alignment, matching executor kAlign).
+- KV-03: `KvCache.format` records the format; `Executor` takes it
+  from `ModelOptions.kv_cache_format` (engine.cpp) and
+  `CacheBytes` sizes K/V regions through `KvCacheStorageBytes`;
+  `CreateCache` carves via `KvCacheRowBytes`. For f16 every figure
+  reduces to the pre-campaign formula exactly. CreateCache refuses
+  non-f16 with a named error until the write/read paths land
+  (Phases 2–3): sized and plumbed, never silently corrupt.
+- KV-04: `extension.json` declares `--kv-cache-type` (serve /
+  bench / prompt / chat); `ApplyProviderOptions` resolves flag >
+  GUFO_KV_CACHE_TYPE > silent f16 default into ModelOptions. An
+  explicit selection prints `[gemma4] kv cache type: <name> (from
+  <source>)` on stderr once per model load; an invalid value
+  throws naming value + source. Diagnose-side format reporting
+  rides the core slice in Phase 7 (KV-14), recorded there.
+- Test: `tests/kv_cache_format_test.cpp`, registered as
+  `gemma4.kv_cache_format` (extension.cmake + extension.json).
+  Pins parse/name/row sizes and the storage math, including the
+  KV-02 baseline figure (220,160 f16 B/token for the 26B-A4B
+  geometry) and the q8_0 ring-scale figure (71,303,168 B for one
+  sliding layer at 16,384 slots vs 134,217,728 B f16).
+
+Verification (2026-11-17, device):
+- nix build of the Phase 1 tree: clean, 2m07s wall (store path
+  9gz90mf3…-gufo-0-unstable-4938016); clang-format clean on all
+  touched files. NOTE for detached units: pass
+  `--extra-experimental-features "nix-command flakes"` — a unit
+  without the login shell's nix config fails instantly with
+  "experimental Nix feature 'nix-command' is disabled" and the
+  build silently does nothing (first attempt, 0.014 s, no-op).
+- Host test: standalone compile of the registered test source
+  (g++ -std=c++20 -Wall -Wextra, headers only) → PASS. The full
+  CMake preset test build was not run in this slice; the test is
+  wired for `ctest -R gemma4.kv_cache_format` on that road.
+- f16 identity, Phase 1 binary (`result/bin/gufo`), full harness
+  re-run (label phase1-f16): all five probe answers byte-identical
+  to baseline (timing lines excluded); bench medians vs baseline —
+  pp512 2242.28 (+0.20%), pp4096 2934.02 (−0.20%), pp16384
+  2537.75 (−0.30%), tg512 42.71 (+0.05%), tg4096 41.19 (+0.02%),
+  tg16384 39.91 (+0.03%) — noise, no regression.
+- Plumbing battery (Phase 1 binary): `--kv-cache-type q8_0` →
+  report line + session refusal naming q8_0; env
+  GUFO_KV_CACHE_TYPE=q8_0 → same; env =bogus → fast error
+  "GUFO_KV_CACHE_TYPE: unknown KV cache type 'bogus'; use f16 or
+  q8_0"; `--kv-cache-type q4_0` → reserved error naming the flag;
+  `--kv-cache-type f16` → report line + normal answer; bogus env
+  + f16 flag → flag wins, normal answer.
+- The installed profile (~/.nix-profile) still runs the
+  pre-campaign build and gufo-resident.service is untouched, per
+  the Phase 7 integration plan; Ollama (:11434) untouched.
