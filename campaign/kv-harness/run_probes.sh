@@ -68,21 +68,30 @@ if [ "$ready" -ne 1 ]; then
 fi
 if ! python3 - "$LONGTXT" "$PORT" "$OUT/LONG-1.err" \
     > "$OUT/LONG-1.raw.json" <<'PYEOF'
-import json, sys, urllib.error, urllib.request
+import json, sys, time, urllib.error, urllib.request
 text = open(sys.argv[1]).read()
 body = json.dumps({
     "model": "kv-probe",
     "messages": [{"role": "user", "content": text}],
     "temperature": 0, "seed": 42, "max_tokens": 32,
 }).encode()
-req = urllib.request.Request(
-    "http://127.0.0.1:%s/v1/chat/completions" % sys.argv[2],
-    data=body, headers={"Content-Type": "application/json"})
-try:
-    sys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())
-except urllib.error.HTTPError as e:
-    open(sys.argv[3], "w").write("HTTP %s: %s" % (e.code, e.read().decode()))
-    sys.exit(1)
+url = "http://127.0.0.1:%s/v1/chat/completions" % sys.argv[2]
+# The HTTP layer binds before the model finishes loading and chat
+# completions answer 503 "Loading model" until then; /v1/models is
+# NOT a readiness signal. Retry the POST itself on 503.
+for attempt in range(40):
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        sys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())
+        break
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()
+        if e.code == 503 and attempt < 39:
+            time.sleep(3)
+            continue
+        open(sys.argv[3], "w").write("HTTP %s: %s" % (e.code, detail))
+        sys.exit(1)
 PYEOF
 then
   echo "LONG-1 FAILED: $(cat "$OUT/LONG-1.err")" >&2
