@@ -655,7 +655,7 @@ R2 arithmetic unchanged.
 - Phase 2 gate: PASSED 2026-11-17 — evidence in the KV-06 section above.
 - Phase 3 gate: PASSED 2026-11-17 -- evidence in the KV-08 section above.
 - Phase 4 gate: PASSED 2026-11-17 -- evidence in the KV-10 section above.
-- Phase 5 gate: OPEN -- KV-12 evidence above (pp16384 -2.98 pct, real); KV-12b staging tweak measured -2.45 pct on the superseded design; the REDO gate (strictly faster at all sizes) governs from 3ca9f6a.
+- Phase 5 gate: OPEN, REDO R5 RUN FAILED 2026-11-17 -- pp512 +0.78 pct, pp4096 -0.15 pct (not faster), pp16384 -3.24 pct vs same-binary f16; probes byte-identical, host test PASS. R7 loop law: new approach round starts; Phase 6 does not start.
 
 ## Phase 1 (KV-03 + KV-04) — format field, allocation, plumbing
 
@@ -1126,3 +1126,52 @@ host test PASS). If the gate fails, R7's loop law starts a
 new approach round; this audit is one of its inputs (the
 remaining pp16384 gap after R2 was ~-3.4 pct, and R3 as
 designed cannot be counted toward closing it).
+
+## Phase 5 REDO R5 -- gate run (2026-11-17, run 15:22-15:41 EST, banked by keeper tick 15:44 EST)
+
+Gate protocol per KV_PHASE5_REDO.md R5: unchanged harness,
+median of 5, warmup discarded, same-binary f16 comparison,
+raised bar (q8_0 strictly faster than f16 at pp512 / pp4096 /
+pp16384). Binary: harness default gufo (labels r5-q8 /
+r5-f16, results device-side under campaign/kv-harness/
+results/r5-q8 and r5-f16). MemAvailable ~91 GiB at both
+matrix starts (the 124 GiB seen at tick start had settled;
+well above the 40 GiB floor). Ollama :11434 and
+gufo-resident.service untouched.
+
+Prefill medians (tok/s, 5 runs):
+- pp512: q8 2207.91 vs f16 2190.91 (+0.78 pct)
+- pp4096: q8 2882.42 vs f16 2886.76 (-0.15 pct)
+- pp16384: q8 2446.69 vs f16 2528.64 (-3.24 pct)
+Spreads: pp16384 tight (q8 2440.83-2452.60, f16
+2521.49-2531.62), so the 16k gap is real, not noise.
+pp4096 is inside its wider spread and is recorded as
+not-faster, not as a proven regression.
+
+Probes: all five byte-identical q8_0 vs same-binary f16
+(Model Load timing line excluded) -- FACT-1 Paris,
+FACT-2 Au, FACT-3 366, COH-1 identical text, LONG-1
+47-12-89. Verified by direct diff this tick.
+
+Host kv_cache_format test: PASS, standalone compile this
+tick, roundtrip numbers identical to R2 (K 0.010000 /
+48.25 dB, V 0.010000 / 48.15 dB, ring 0.006234,
+derived-K 0.015822 / 47.14 dB).
+
+Decode spot (recorded, not this gate): tg512 36.70 vs
+42.14, tg4096 33.37 vs 40.56, tg16384 32.27 vs 39.21.
+
+VERDICT: Phase 5 gate FAILS on the raised bar. pp512
+passes, pp4096 is not faster, pp16384 remains ~3.2 pct
+behind f16 -- the same LDS bf16 round-trip gap R2 left,
+with R3 proven unbuildable in the current architecture
+(audit above) and R4 not yet attempted as its own
+construction. Per R7 loop law, a new approach round
+starts from this evidence; candidates on record: R4
+derived-K globals loaded once (interleaved with the
+R2-global kernel), R6 bounded experiments (E1 fused-V
+scale-folding with its decision rule recorded before it
+starts; E2 int8-WMMA QK spike, microbenchmark only), or
+the executor-level R3 redesign, which needs Volmarr word
+as a future round. Phase 6 (KV-13) does NOT start.
+No quantized mode becomes any default.
