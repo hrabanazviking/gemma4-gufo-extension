@@ -1319,3 +1319,36 @@ f16 at pp512 / pp4096 / pp16384, five probes byte-identical,
 host test PASS). If the gate still fails, the next R7 round
 takes on the LDS bf16 round-trip itself. No quantized mode
 becomes any default.
+
+## Phase 5 REDO R7 round 2 -- R5 gate re-run on R4 state (2026-11-17, gate run 17:09-17:28 EST, banked by keeper tick 17:34 EST)
+
+Gate protocol per KV_PHASE5_REDO.md R5, on banked HEAD
+4209ef2 (R4 rotated-K fusion). Labels r7gate-q8 / r7gate-f16,
+same binary result/bin/gufo. MemAvailable ~124 GiB at both
+starts. Host kv_cache_format test PASS, roundtrip numbers
+identical to R2 (K 0.010000 / 48.25 dB, V 0.010000 / 48.15 dB,
+ring 0.006234, derived-K 0.015822 / 47.14 dB).
+
+Prefill medians (tok/s, 5 runs, warmup discarded):
+- pp512: q8 2178.59 vs f16 2208.61 (-1.36 pct)
+- pp4096: q8 2692.32 vs f16 2896.93 (-7.06 pct)
+- pp16384: q8 2421.44 vs f16 2537.17 (-4.56 pct)
+Spreads: f16 sets tight; q8 pp16384 2402.98-2441.70 vs f16
+2534.59-2540.34, so the 16k gap is real, not noise.
+
+Probes: all five byte-identical q8_0 vs same-binary f16
+(Model Load timing line excluded), verified by direct diff
+this tick -- FACT-1 Paris, FACT-2 Au, FACT-3 366, COH-1
+identical text, LONG-1 47-12-89.
+
+Decode spot (recorded, not this gate): q8 tg 36.73 / 33.33 /
+32.32 vs f16 42.13 / 40.62 / 39.24.
+
+VERDICT: Phase 5 gate FAILS on the raised bar again -- q8 is
+slower than same-binary f16 at all three prefill lengths on
+this run. The R4 fusion did not close the gap; the LDS bf16
+round-trip remains the named suspect, as the R4 audit
+predicted (rotated-K is at most about a fifth of global fetch
+traffic). Per R7 loop law, the next round takes on the LDS
+bf16 round-trip itself. Phase 6 (KV-13) does NOT start. No
+quantized mode becomes any default.
