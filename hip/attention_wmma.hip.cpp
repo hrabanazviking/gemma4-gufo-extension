@@ -434,9 +434,7 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
           // then dequantizes exactly its own chunk with
           // DequantQ8Chunk's arithmetic, so the staged tile is
           // bit-identical and no bf16 scratch or staging pass
-          // exists. The rotated-K chunks keep the per-chunk road:
-          // their chunk lanes span waves, so no in-wave
-          // distribution exists for them.
+          // exists.
           const std::uint32_t key_a = key0 + chunk_key(0);
           const std::uint32_t d8 = chunk_d8(0);
           const std::uint32_t blk = d8 / 32;
@@ -483,9 +481,49 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
           v_next[0] = DequantQ8Packed(packed_a, scale_a);
           v_next[1] = DequantQ8Packed(packed_b, scale_b);
           if (rot_wave) {
-            k_rot = DequantQ8Chunk(a.k_cache_q8, rot_row_bytes_q8,
-                                   key0 + tid % kKeys, kv_head,
-                                   2 * kGlobalPairs, (tid / kKeys) * 8);
+            // R7-R4: fused dequant-on-load for the rotated-K store,
+            // half-block form (audit: Phase 5 REDO R7 round 2 in
+            // campaign/KV_PROGRESS.md). Inside one wave, lanes l
+            // and l + 16 hold chunks 2c and 2c + 1 of the same
+            // 32-value block for the SAME key (a wave covers two
+            // consecutive dim groups for all 16 keys), so lane l
+            // loads the half block (16 codes as one uint4 from the
+            // payload plane, the block fp16 scale once from the
+            // scale plane, via LoadQ8HalfBlockRaw with per_head =
+            // 2 * kGlobalPairs) and the raw words + scale bits
+            // reach lane l + 16 by __shfl, executed unconditionally
+            // across each participating wave; waves >= 8 do not
+            // participate and only rot_wave lanes produce k_rot.
+            // Each lane then dequantizes exactly its own chunk
+            // with DequantQ8Packed -- bit-identical arithmetic, so
+            // the staged tile is bit-for-bit the per-chunk road's.
+            // Per block per key: two 16-byte code loads + two
+            // scale loads replace four 8-byte gathers + four scale
+            // re-reads. Partial tiles keep the exact per-chunk
+            // DequantQ8Chunk call and bounds logic below.
+            const std::uint32_t rkey = key0 + tid % kKeys;
+            const std::uint32_t rd8 = (tid / kKeys) * 8;
+            const bool rloader = lane < 16U;
+            const int rsrc = static_cast<int>(rloader ? lane : lane - 16U);
+            std::uint32_t rw[4] = {};
+            std::uint32_t rsb = 0;
+            if (rloader) {
+              LoadQ8HalfBlockRaw(a.k_cache_q8, rot_row_bytes_q8, rkey, kv_head,
+                                 2 * kGlobalPairs, rd8, rw, &rsb);
+            }
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+              rw[w] = static_cast<std::uint32_t>(
+                  __shfl(static_cast<int>(rw[w]), rsrc));
+            }
+            rsb =
+                static_cast<std::uint32_t>(__shfl(static_cast<int>(rsb), rsrc));
+            const std::uint64_t rpacked =
+                rloader ? pack2(rw[0], rw[1]) : pack2(rw[2], rw[3]);
+            const std::uint16_t rs16 = static_cast<std::uint16_t>(rsb);
+            __half rscale;
+            __builtin_memcpy(&rscale, &rs16, sizeof(rs16));
+            k_rot = DequantQ8Packed(rpacked, rscale);
           }
           return;
         }

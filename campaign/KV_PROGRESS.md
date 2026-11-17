@@ -1262,3 +1262,60 @@ Next: implement the R4 rotated-K half-block fusion per this
 spec, bank it with its evidence, then re-run the R5 gate
 protocol. If the gate still fails, the next R7 round takes
 on the LDS bf16 round-trip itself.
+
+## Phase 5 REDO R7 round 2 -- R4 rotated-K half-block fusion IMPLEMENTED (2026-11-17, keeper tick 16:04 EST)
+
+Implementation (hip/attention_wmma.hip.cpp, global full-tile
+q8 fetch only, per the R7 round-2 audit spec above):
+- The rotated-K per-chunk DequantQ8Chunk call in the
+  key0 + kKeys <= block_hi branch is replaced by the fused
+  half-block loader: lane l (< 16) of each participating
+  wave loads the half block via LoadQ8HalfBlockRaw (16 codes
+  as one uint4 from the payload plane, the block fp16 scale
+  once from the scale plane, per_head = 2 * kGlobalPairs);
+  the raw words + scale bits reach lane l + 16 by __shfl,
+  executed unconditionally across each participating wave;
+  each lane then dequantizes exactly its own chunk with
+  DequantQ8Packed (loader pack2(rw[0], rw[1]), partner
+  pack2(rw[2], rw[3])) -- bit-identical arithmetic, so the
+  staged tile is bit-for-bit the per-chunk road's.
+- rot_wave lanes only produce k_rot; waves >= 8 do not
+  participate. The partial-tile road keeps the exact
+  per-chunk DequantQ8Chunk call and its bounds logic,
+  untouched. The stale fetch comment claiming the rotated-K
+  chunks span waves (no in-wave distribution) is removed.
+  clang-format clean on the one touched file.
+
+Verification (2026-11-17, device; binary result ->
+/nix/store/csnxpnmq...-gufo-0-unstable-4938016;
+MemAvailable ~124 GiB at build and at both matrix starts;
+Ollama :11434 and gufo-resident.service untouched):
+- nix build clean (detached, exit 0).
+- Host kv_cache_format test PASS (standalone compile),
+  roundtrip numbers identical to R2: K 0.010000 / 48.25 dB,
+  V 0.010000 / 48.15 dB, ring 0.006234, derived-K 0.015822 /
+  47.14 dB.
+- Probes (labels r7r4-q8 / r7r4-f16, same binary
+  result/bin/gufo, GUFO_KV_CACHE_TYPE per label): all five
+  byte-identical q8_0 vs same-binary f16, Model Load timing
+  line excluded (Paris / Au / 366 / COH-1 same text /
+  LONG-1 47-12-89), verified by direct diff this tick.
+- Prefill medians (tok/s, 5 runs, warmup discarded):
+  q8 pp512 2221.29 (2212.78-2233.50), pp4096 2852.22
+  (2793.37-2880.65), pp16384 2401.79 (2377.53-2441.58);
+  f16 pp512 2135.79, pp4096 2597.03, pp16384 2140.55.
+- HONEST CAVEAT: this session's f16 set sits far below its
+  R5 band (R5 f16 medians 2190.91 / 2886.76 / 2528.64) and
+  q8 pp16384 (2401.79) sits below R5's q8 median 2446.69 --
+  the machine ran slower overall this session, so the
+  apparent q8 margins (+4.0 / +9.8 / +12.2 pct) are
+  variance-inflated and are NOT evidence about the raised
+  bar. NO gate pass is claimed. Decode spot: q8 tg 36.42 /
+  32.98 / 31.90 vs f16 41.85 / 40.41 / 38.72.
+
+Next: re-run the R5 raised-bar gate protocol as a separate
+step on this banked state (strictly faster than same-binary
+f16 at pp512 / pp4096 / pp16384, five probes byte-identical,
+host test PASS). If the gate still fails, the next R7 round
+takes on the LDS bf16 round-trip itself. No quantized mode
+becomes any default.
