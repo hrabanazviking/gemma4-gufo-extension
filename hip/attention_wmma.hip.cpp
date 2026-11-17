@@ -105,6 +105,38 @@ __device__ __forceinline__ void LoadQ8BlockRaw(
       row + (row_bytes / 34) * 32 + blk * 2);
 }
 
+/// R2-sliding: raw load of one HALF block (16 values, two 8-value
+/// chunks) of a q8_0 row in layout v2. The sliding d256 chunk
+/// mapping (see the audit in campaign/KV_PROGRESS.md) puts the
+/// four chunks of a 32-value block in lanes l, l+16, l+32, l+48
+/// -- two waves -- so no in-wave full-block distribution exists;
+/// the two chunks inside one wave sit in lanes l and l+16 (same
+/// key), and the lane holding chunk 0 of the half block loads
+/// all 16 codes as one uint4 plus the block scale once, for
+/// distribution to its partner lane with __shfl. The loader's
+/// d8 is half-block aligned (d8 % 32 is 0 or 16).
+__device__ __forceinline__ void LoadQ8HalfBlockRaw(
+    const std::uint8_t* cache_q8, std::size_t row_bytes, std::uint32_t slot,
+    std::uint32_t kvh, std::uint32_t per_head, std::uint32_t d8,
+    std::uint32_t words[4], std::uint32_t* scale_bits) {
+  const std::uint8_t* row =
+      cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+  const std::size_t blk =
+      static_cast<std::size_t>(kvh) * (per_head / 32) + d8 / 32;
+  const std::uint32_t half_off = (d8 % 32U) & ~15U;
+  union {
+    uint4 u;
+    std::uint32_t w[4];
+  } cvt;
+  cvt.u = *reinterpret_cast<const uint4*>(row + blk * 32 + half_off);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    words[i] = cvt.w[i];
+  }
+  *scale_bits = *reinterpret_cast<const std::uint16_t*>(
+      row + (row_bytes / 34) * 32 + blk * 2);
+}
+
 __device__ __forceinline__ uint4 DequantQ8Chunk(
     const std::uint8_t* cache_q8, std::size_t row_bytes, std::uint32_t slot,
     std::uint32_t kvh, std::uint32_t per_head, std::uint32_t dim0) {
@@ -465,6 +497,72 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
         }
         return;
       }
+    }
+    if constexpr (kQ8 && !kGlobal && D == 256) {
+      // R2-sliding: fused dequant-on-load, half-block form (the
+      // audit in campaign/KV_PROGRESS.md records why the global
+      // full-block form cannot apply here). This instantiation
+      // stages one chunk per thread (kStage == 1): lanes l and
+      // l + 16 of a wave hold chunks 2c and 2c + 1 of one block
+      // for the SAME key, so lane l loads the half block (16
+      // codes as one uint4 from the payload plane, the fp16
+      // scale once from the scale plane) for both K and V and
+      // the raw words + scale bits reach lane l + 16 by __shfl;
+      // each lane dequantizes exactly its own chunk with
+      // DequantQ8Packed, so the staged tile is bit-identical.
+      // Per block and cache: two 16-byte code loads + two scale
+      // loads replace four 8-byte gathers + four scale re-reads.
+      // Partial tiles keep the exact per-key bounds: the pair
+      // shares one key, so one validity flag covers both lanes,
+      // and __shfl runs unconditionally for the whole wave.
+      static_assert(kStage == 1, "sliding fused loader: one chunk");
+      const std::uint32_t position = key0 + chunk_key(0);
+      const std::uint32_t d8 = chunk_d8(0);
+      k_next[0] = make_uint4(0U, 0U, 0U, 0U);
+      v_next[0] = make_uint4(0U, 0U, 0U, 0U);
+      const bool valid = position < block_hi;
+      const bool loader = lane < 16U;
+      const int src = static_cast<int>(loader ? lane : lane - 16U);
+      std::uint32_t kw[4] = {};
+      std::uint32_t vw[4] = {};
+      std::uint32_t ksb = 0;
+      std::uint32_t vsb = 0;
+      if (loader && valid) {
+        const std::uint32_t slot =
+            static_cast<std::uint32_t>(slot_of(position));
+        LoadQ8HalfBlockRaw(a.k_cache_q8, row_bytes_q8, slot, kv_head, D, d8, kw,
+                           &ksb);
+        LoadQ8HalfBlockRaw(a.v_cache_q8, row_bytes_q8, slot, kv_head, D, d8, vw,
+                           &vsb);
+      }
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        kw[w] =
+            static_cast<std::uint32_t>(__shfl(static_cast<int>(kw[w]), src));
+        vw[w] =
+            static_cast<std::uint32_t>(__shfl(static_cast<int>(vw[w]), src));
+      }
+      ksb = static_cast<std::uint32_t>(__shfl(static_cast<int>(ksb), src));
+      vsb = static_cast<std::uint32_t>(__shfl(static_cast<int>(vsb), src));
+      if (valid) {
+        const auto pack2 = [](std::uint32_t lo, std::uint32_t hi) {
+          return static_cast<std::uint64_t>(lo) |
+                 (static_cast<std::uint64_t>(hi) << 32);
+        };
+        const std::uint64_t pk =
+            loader ? pack2(kw[0], kw[1]) : pack2(kw[2], kw[3]);
+        const std::uint64_t pv =
+            loader ? pack2(vw[0], vw[1]) : pack2(vw[2], vw[3]);
+        const std::uint16_t kb16 = static_cast<std::uint16_t>(ksb);
+        const std::uint16_t vb16 = static_cast<std::uint16_t>(vsb);
+        __half kscale;
+        __half vscale;
+        __builtin_memcpy(&kscale, &kb16, sizeof(kb16));
+        __builtin_memcpy(&vscale, &vb16, sizeof(vb16));
+        k_next[0] = DequantQ8Packed(pk, kscale);
+        v_next[0] = DequantQ8Packed(pv, vscale);
+      }
+      return;
     }
 #pragma unroll
     for (std::uint32_t j = 0; j < kStage; ++j) {

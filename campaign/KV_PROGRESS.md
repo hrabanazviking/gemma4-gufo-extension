@@ -935,3 +935,77 @@ Next: R2 sliding (d256) -- the same block-load + in-wave
 distribution applied to the sliding WMMA path, whose chunk
 lanes must be audited first (its thread mapping differs);
 then R3 current-chunk bypass; then the R5 gate run.
+
+## Phase 5 REDO R2-sliding -- fused dequant-on-load, sliding d256 (2026-11-17, builder tick 14:29 EST)
+
+Audit (hip/attention_wmma.hip.cpp, sliding instantiation
+Launch<256, 2, 4>): D=256, kHeads=2, kQueryBlocks=4 gives
+kThreads=512, kWavesPerRow=2, kChunks=512, kStage=1 -- each
+thread stages exactly ONE 8-value chunk per tile, with
+chunk_key = tid % 16 and chunk_d8 = (tid / 16) * 8. The four
+chunks of one 32-value block for one key therefore sit in
+lanes tid, tid+16, tid+32, tid+48: TWO waves, not one (the
+global path's lanes tid, tid+8, tid+16, tid+24 all live in
+one wave). A full-block in-wave distribution like
+R2-global's does NOT exist for sliding. What does exist:
+inside one wave, lanes l and l+16 hold chunks 2c and 2c+1
+of the same block for the SAME key (a wave covers two
+consecutive chunk indices for all 16 keys), so a half-block
+(16-value) in-wave distribution is available, and the pair
+shares one key, hence one slot and one validity flag.
+
+Banked design (closest correct fused variant, per the redo
+plan's audit-first rule): `LoadQ8HalfBlockRaw` loads one
+half block -- 16 codes as one uint4 from the contiguous
+payload plane, the block's fp16 scale once from the scale
+plane. In the sliding full fetch, the chunk-2c lane loads
+the half block for both K and V and the raw words + scale
+bits reach lane l+16 by __shfl (executed unconditionally
+for the whole wave); each lane dequantizes exactly its own
+chunk with DequantQ8Packed (bit-identical bf16(int8) *
+bf16(scale) arithmetic). Per block per cache: two 16-byte
+code loads + two scale loads replace four 8-byte gathers +
+four scale re-reads. Proven LDS store paths unchanged;
+partial tiles keep the exact per-key bounds (the pair's
+shared key gives one validity flag; out-of-range pairs
+stage zeros exactly as the per-chunk road did). Scope:
+D==256 non-global q8 only; the D512 non-global fallback
+and all f16 roads are untouched.
+
+Verification (2026-11-17, device; binary result ->
+/nix/store/3137nkac...-gufo-0-unstable-4938016; MemAvailable
+~124 GiB throughout; Ollama :11434 and
+gufo-resident.service untouched):
+- nix build clean (detached transient unit, exit 0;
+  re-run confirms the same store path from cache);
+  clang-format clean on the one touched file
+  (hip/attention_wmma.hip.cpp).
+- Host kv_cache_format test PASS, roundtrip numbers
+  identical to R2-global step 1 (K 0.010000 / 48.25 dB,
+  V 0.010000 / 48.15 dB, ring 0.006234, derived-K
+  0.015822 / 47.14 dB).
+- Probes (labels r2sl-q8 / r2sl-f16): all five answers
+  byte-identical q8_0 vs same-binary f16, model-load
+  timing line excluded (Paris / Au / 366 / COH-1 same
+  text / 47-12-89), and identical to the R2-global
+  step-2 answers.
+- Prefill medians (tok/s, 5 runs): pp512 2209.99 vs f16
+  2101.37 (+5.17 pct), pp4096 2860.55 vs 2807.72
+  (+1.88 pct), pp16384 2438.34 vs 2524.45 (-3.41 pct).
+  Honest caveats: the f16 pp512 set this run is ragged
+  (runs 1336.31 / 2072.60 / 2101.37 / 2132.49 / 2154.70 --
+  one deep outlier and a median below the ~2190 band of
+  the R2-global runs), so the pp512 margin is overstated
+  by an unknown amount; q8 spreads were ~0.7-2.7 pct.
+  Decode spot q8 36.63 / 33.29 / 32.20 vs f16 42.04 /
+  40.65 / 39.19 (decode is not this phase's gate).
+  NO Phase 5 gate pass: pp16384 remains ~3.4 pct behind
+  f16, the same gap as after R2-global step 2 -- the
+  sliding fusion removes its redundant loads without a
+  regression but does not move the 16k gap, which keeps
+  pointing at the LDS bf16 round-trip itself and the
+  still per-chunk rotated-K road on the global layers.
+
+Next: R3 current-chunk bypass (quantize->dequantize
+transformation reproduced in-register; raw unquantized
+values FORBIDDEN); then the R5 gate run.
