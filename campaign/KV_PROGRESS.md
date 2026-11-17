@@ -82,7 +82,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-09 global layers derived-K | DONE | section below; reconstruction max_abs_err 0.015822, SNR 47.14 dB; probes byte-identical to f16 |
 | KV-10 global validation gate | DONE | section below; Phase 4 gate PASSED; probes identical excl load timing; matrix kv10-q8 vs kv10-f16 recorded |
 | KV-11 non-WMMA prefill q8_0 | DONE | section below; probes byte-identical q8 vs f16; pp4096 +40.7 pct, pp16384 +103.8 pct vs KV-10 q8 |
-| KV-12 WMMA prefill / dispatch rule | IMPLEMENTED, GATE OPEN | section below; WMMA dequant-tile stage landed, probes byte-identical; pp16384 -2.98 pct vs f16 is real, beyond noise -- Phase 5 gate not yet passed |
+| KV-12 WMMA prefill / dispatch rule | SUPERSEDED BY REDO 2026-11-17, GATE OPEN | section below; WMMA dequant-tile stage landed, probes byte-identical; pp16384 -2.98 pct vs f16 is real, beyond noise -- Phase 5 gate not yet passed |
 | KV-13 machinery re-proof | PENDING | |
 | KV-14 full-stack integration | PENDING | |
 | KV-15 resident service re-proof | PENDING | |
@@ -685,3 +685,32 @@ Verification (2026-11-17, device):
 - The installed profile (~/.nix-profile) still runs the
   pre-campaign build and gufo-resident.service is untouched, per
   the Phase 7 integration plan; Ollama (:11434) untouched.
+
+## Phase 5 REDO — commissioned 2026-11-17 (Volmarr's order)
+
+Volmarr's word, 2026-11-17 12:20 EST: Phase 5 is redone in
+full on a researched new approach; 12:25 EST: the loop repeats
+with new approaches until success. The KV-12 dequant-tile
+STAGING approach above is SUPERSEDED — its commit (81190ea)
+stays as history, its gate stays OPEN and unpassed.
+
+Redo plan: `campaign/KV_PHASE5_REDO.md` (research report +
+ChatGPT consultation synthesis; both converged on the same
+first move). In brief: R1 layout audit (separate scale plane,
+per-head-contiguous tile-major, only if reads do not already
+coalesce) → R2 fused dequant-on-load into the LDS tile,
+GQA-group-shared, manual fragment construction, global d512
+first then sliding d256, single- vs double-buffer measured →
+R3 current-chunk round-trip bypass with the quantize->
+dequantize transformation reproduced in-register (raw
+unquantized values FORBIDDEN) → R4 derived-K globals loaded
++ dequantized once per tile. R6 bounded fallbacks (E1 fused-V
+scale-folding, E2 int8-WMMA QK spike) only if R1–R4 land
+short, each with its decision rule recorded here first.
+
+Redo gate (raised bar): q8_0 STRICTLY FASTER than same-binary
+f16 beyond noise at pp512 AND pp4096 AND pp16384, all 5
+probes byte-identical, kv_cache_format test PASS. Redo slices
+track under KV-11/KV-12. Next step for the next builder/keeper
+tick: R1 layout audit of the QkvPost write path and the WMMA
+tile reads, recorded here, then R2-global.

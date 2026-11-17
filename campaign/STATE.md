@@ -90,3 +90,11 @@ line) consumes this extension through the build flake in the dev
 clone's parent tree. When this line changes, the core line's build
 must be re-proven end to end (resting state, first-call load,
 unload rules) before the new build is installed.
+
+## Phase 5 REDO (2026-11-17)
+
+Volmarr ordered a total redo of Phase 5 on a researched new
+approach (bar: q8_0 prefill faster than f16 at 512/4096/16384,
+probes byte-identical; loop until success). Plan banked at
+`campaign/KV_PHASE5_REDO.md`; the KV-12 staging commit stays
+as history with its gate open. Details in KV_PROGRESS.md.
