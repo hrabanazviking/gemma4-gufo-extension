@@ -1,0 +1,6 @@
+# Frozen probe set for the KV campaign. One probe per line: ID :: PROMPT
+# Greedy decoding (temperature 0, seed 42, thinking off) — see run_probes.sh.
+FACT-1 :: What is the capital of France? Answer with the name only.
+FACT-2 :: What is the chemical symbol for gold? Answer with the symbol only.
+FACT-3 :: How many days are there in a leap year? Answer with the number only.
+COH-1 :: Write a two-sentence story about a fox crossing a frozen river.
