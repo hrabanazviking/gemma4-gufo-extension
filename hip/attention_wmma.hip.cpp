@@ -53,6 +53,58 @@ __device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
 /// code * scale, rounded to
 /// binary16 -- the same dequantized tile the non-WMMA paths stage
 /// (KV-07/KV-09), so a prefill row computes what decode computes.
+/// R2-global step 2: the eight-value dequant at the heart of
+/// DequantQ8Chunk, factored out so the fused block loader can
+/// dequantize a chunk whose codes and scale arrived by another
+/// route. The product rounds once either way: a code is exact in
+/// binary16 and in FP32, the scale is a binary16 value, and their
+/// exact product (at most 18 mantissa bits) rounds to binary16
+/// identically in both arithmetics -- so every caller stages the
+/// bit-for-bit tile the FP32 dequant paths stage.
+__device__ __forceinline__ uint4 DequantQ8Packed(std::uint64_t packed,
+                                                 __half scale) {
+  union {
+    uint4 u;
+    __half h[8];
+  } cvt;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    cvt.h[i] = __hmul(__int2half_rn(static_cast<int>(static_cast<std::int8_t>(
+                          static_cast<std::uint8_t>(packed >> (8 * i))))),
+                      scale);
+  }
+  return cvt.u;
+}
+
+/// R2-global step 2: raw load of one full 32-value q8_0 block in
+/// layout v2 -- the 32 codes as eight words from the contiguous
+/// payload plane, the block's fp16 scale bits from the separate
+/// scale plane. One such load serves all four 8-value chunks of
+/// the block, where the per-chunk road re-reads the scale (and
+/// gathers the codes 8 bytes at a time) once per chunk.
+__device__ __forceinline__ void LoadQ8BlockRaw(
+    const std::uint8_t* cache_q8, std::size_t row_bytes, std::uint32_t slot,
+    std::uint32_t kvh, std::uint32_t per_head, std::uint32_t block,
+    std::uint32_t words[8], std::uint32_t* scale_bits) {
+  const std::uint8_t* row =
+      cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+  const std::size_t blk =
+      static_cast<std::size_t>(kvh) * (per_head / 32) + block;
+  union {
+    uint4 u[2];
+    std::uint32_t w[8];
+  } cvt;
+  const auto* payload = reinterpret_cast<const uint4*>(row + blk * 32);
+  cvt.u[0] = payload[0];
+  cvt.u[1] = payload[1];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    words[i] = cvt.w[i];
+  }
+  *scale_bits = *reinterpret_cast<const std::uint16_t*>(
+      row + (row_bytes / 34) * 32 + blk * 2);
+}
+
 __device__ __forceinline__ uint4 DequantQ8Chunk(
     const std::uint8_t* cache_q8, std::size_t row_bytes, std::uint32_t slot,
     std::uint32_t kvh, std::uint32_t per_head, std::uint32_t dim0) {
@@ -72,22 +124,7 @@ __device__ __forceinline__ uint4 DequantQ8Chunk(
   // the staged tile is bit-for-bit identical.
   std::uint64_t packed;
   __builtin_memcpy(&packed, row + blk * 32 + dim0 % 32, sizeof(packed));
-  union {
-    uint4 u;
-    __half h[8];
-  } cvt;
-  // The product rounds once either way: a code is exact in binary16
-  // and in FP32, the scale is a binary16 value, and their exact
-  // product (at most 18 mantissa bits) rounds to binary16 identically
-  // in both arithmetics -- so the staged tile is bit-for-bit the one
-  // the FP32 dequant paths stage, at half the conversion cost.
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    cvt.h[i] = __hmul(__int2half_rn(static_cast<int>(static_cast<std::int8_t>(
-                          static_cast<std::uint8_t>(packed >> (8 * i))))),
-                      scale);
-  }
-  return cvt.u;
+  return DequantQ8Packed(packed, scale);
 }
 
 __device__ __forceinline__ v16h LoadFrag(const __half* p) {
@@ -353,16 +390,66 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
     if constexpr (kGlobal) {
       if (key0 + kKeys <= block_hi) {
         if constexpr (kQ8) {
-          // KV-12: the tile's values and rotated key dims dequantize
-          // from the q8_0 stores (global layers have ring == 0, so a
-          // key IS its slot). chunk_key(0) / chunk_d8(0) name this
-          // thread's key and 8 dims, as in the binary16 road.
+          // R2-global step 2: fused dequant-on-load for the V store
+          // (global layers have ring == 0, so a key IS its slot).
+          // The four 8-value chunks of one 32-value block sit in
+          // lanes tid, tid + 8, tid + 16, tid + 24 -- same key pair,
+          // dims 8 * (tid / 8) .. +31 -- so the chunk-0 lane loads
+          // the WHOLE block once per key of its pair (codes
+          // contiguous in the layout-v2 payload plane, the fp16
+          // scale read once from the scale plane) and the raw words
+          // are distributed inside the wave with __shfl; every lane
+          // then dequantizes exactly its own chunk with
+          // DequantQ8Chunk's arithmetic, so the staged tile is
+          // bit-identical and no bf16 scratch or staging pass
+          // exists. The rotated-K chunks keep the per-chunk road:
+          // their chunk lanes span waves, so no in-wave
+          // distribution exists for them.
           const std::uint32_t key_a = key0 + chunk_key(0);
           const std::uint32_t d8 = chunk_d8(0);
-          v_next[0] =
-              DequantQ8Chunk(a.v_cache_q8, row_bytes_q8, key_a, kv_head, D, d8);
-          v_next[1] = DequantQ8Chunk(a.v_cache_q8, row_bytes_q8, key_a + 1,
-                                     kv_head, D, d8);
+          const std::uint32_t blk = d8 / 32;
+          const std::uint32_t q = (tid / 8) % 4;
+          const int src = static_cast<int>(tid - q * 8);
+          std::uint32_t wa[8] = {};
+          std::uint32_t wb[8] = {};
+          std::uint32_t sa = 0;
+          std::uint32_t sb = 0;
+          if (q == 0) {
+            LoadQ8BlockRaw(a.v_cache_q8, row_bytes_q8, key_a, kv_head, D, blk,
+                           wa, &sa);
+            LoadQ8BlockRaw(a.v_cache_q8, row_bytes_q8, key_a + 1, kv_head, D,
+                           blk, wb, &sb);
+          }
+#pragma unroll
+          for (int w = 0; w < 8; ++w) {
+            wa[w] = static_cast<std::uint32_t>(
+                __shfl(static_cast<int>(wa[w]), src));
+            wb[w] = static_cast<std::uint32_t>(
+                __shfl(static_cast<int>(wb[w]), src));
+          }
+          sa = static_cast<std::uint32_t>(__shfl(static_cast<int>(sa), src));
+          sb = static_cast<std::uint32_t>(__shfl(static_cast<int>(sb), src));
+          const auto pack2 = [](std::uint32_t lo, std::uint32_t hi) {
+            return static_cast<std::uint64_t>(lo) |
+                   (static_cast<std::uint64_t>(hi) << 32);
+          };
+          std::uint64_t packed_a = 0;
+          std::uint64_t packed_b = 0;
+#pragma unroll
+          for (std::uint32_t c = 0; c < 4; ++c) {
+            if (q == c) {
+              packed_a = pack2(wa[2 * c], wa[2 * c + 1]);
+              packed_b = pack2(wb[2 * c], wb[2 * c + 1]);
+            }
+          }
+          const std::uint16_t sab = static_cast<std::uint16_t>(sa);
+          const std::uint16_t sbb = static_cast<std::uint16_t>(sb);
+          __half scale_a;
+          __half scale_b;
+          __builtin_memcpy(&scale_a, &sab, sizeof(sab));
+          __builtin_memcpy(&scale_b, &sbb, sizeof(sbb));
+          v_next[0] = DequantQ8Packed(packed_a, scale_a);
+          v_next[1] = DequantQ8Packed(packed_b, scale_b);
           if (rot_wave) {
             k_rot = DequantQ8Chunk(a.k_cache_q8, rot_row_bytes_q8,
                                    key0 + tid % kKeys, kv_head,

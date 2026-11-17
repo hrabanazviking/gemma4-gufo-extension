@@ -854,3 +854,84 @@ byte identity, and it passes.
 Next: R2-global step 2 -- the fused dequant-on-load loader
 written against this layout (global d512 first), then the R5
 gate run under the raised bar.
+
+## Phase 5 REDO R2-global step 2 -- fused dequant-on-load loader, global d512 (2026-11-17, builder tick 13:28 EST)
+
+The fused loader landed for the global (d512, kGlobal) WMMA
+prefill path, written against layout v2. Two designs were
+built and measured this tick; only the second is banked.
+
+Banked design (fetch-side fusion, proven stores untouched):
+- `DequantQ8Packed(packed, scale)` factors the 8-value dequant
+  out of `DequantQ8Chunk` (same bf16(int8) * bf16(scale)
+  arithmetic, unchanged); `DequantQ8Chunk` now delegates to it,
+  so every existing caller stages bit-identical values.
+- `LoadQ8BlockRaw` loads one full 32-value block: codes as two
+  uint4 words from the contiguous payload plane, the fp16
+  scale bits once from the scale plane.
+- In the global full-tile q8 fetch, the four chunks of a block
+  sit in lanes tid, tid+8, tid+16, tid+24 (same key pair), so
+  the chunk-0 lane loads the whole block for both keys of its
+  pair and the raw words + scale bits are distributed inside
+  the wave with __shfl; each lane dequantizes exactly its own
+  chunk into the same v_next registers the KV-12 road filled.
+  Per block: one 32-byte code load + one scale load, where the
+  per-chunk road issued four 8-byte gathers and re-read the
+  scale four times. No global bf16 scratch, no separate
+  staging pass; the LDS store paths, register footprint and
+  f16 road are byte-for-byte the KV-12 ones.
+- Scope kept: partial tiles keep the per-chunk road (their
+  bounds logic is unchanged); the rotated-K chunks keep the
+  per-chunk road (their chunk lanes span waves, so no in-wave
+  distribution exists); sliding d256 is untouched (its step
+  follows R2-global). R4's rule holds: the V block's values
+  still serve both the K-from-V dims and the V tile from the
+  same registers -- nothing is read or dequantized twice.
+  Single- vs double-buffer measurement was NOT taken this
+  step: the register-prefetch structure (fetch next tile
+  before the current tile's stores) is unchanged from KV-12,
+  so there was no new buffering choice to measure.
+
+Rejected design (built, measured, reverted before banking):
+a wider fusion -- each thread dequantizing a full V block
+into new fused registers, with new K/V^T LDS store paths
+(scalar transposed stores, DPP full-block exchange) -- was
+bit-correct (all probes identical) but SLOW: same-binary
+medians pp512 2201.68 vs f16 2196.65 (+0.23 pct), pp4096
+2713.67 vs 2932.04 (-7.45 pct), pp16384 2020.83 vs 2523.04
+(-19.90 pct). The regression grew with context, i.e. with
+attention share, indicting the new store paths / wider live
+registers, not the loads. It was reverted in full; the
+banked design keeps the proven stores. Recorded so the
+approach is not retried blind.
+
+Verification (2026-11-17, device; binary result ->
+/nix/store/vc1p846n...-gufo-0-unstable-4938016; MemAvailable
+~124 GiB throughout; Ollama :11434 and gufo-resident.service
+untouched):
+- nix build clean (detached, exit 0); clang-format clean on
+  the one touched file (hip/attention_wmma.hip.cpp).
+- Host kv_cache_format test PASS, roundtrip numbers
+  identical to step 1 (K 0.010000 / 48.25 dB, V 0.010000 /
+  48.15 dB, ring 0.006234, derived-K 0.015822 / 47.14 dB).
+- Probes (labels r2s2b-q8 / r2s2b-f16): all five answers
+  byte-identical q8_0 vs same-binary f16, model-load timing
+  line excluded (Paris / Au / 366 / COH-1 same text /
+  47-12-89), and identical to the step-1 answers.
+- Prefill medians (tok/s, 5 runs, spreads ~0.3-0.5 pct):
+  pp512 2218.59 vs f16 2193.49 (+1.14 pct), pp4096 2866.38
+  vs 2906.20 (-1.37 pct), pp16384 2434.77 vs 2521.03
+  (-3.42 pct). Decode spot q8 36.69 / 33.29 / 32.2, in the
+  family of the previous runs. NO Phase 5 gate pass: the R5
+  raised bar (strictly faster at all three sizes) is not
+  met, as expected this step -- the fused loader removes
+  the redundant scale reads and narrow gathers without a
+  regression, but the remaining pp16384 gap lives elsewhere
+  (the LDS bf16 round-trip itself and the still per-chunk
+  rotated-K / sliding roads are the named suspects for the
+  next rounds).
+
+Next: R2 sliding (d256) -- the same block-load + in-wave
+distribution applied to the sliding WMMA path, whose chunk
+lanes must be audited first (its thread mapping differs);
+then R3 current-chunk bypass; then the R5 gate run.
