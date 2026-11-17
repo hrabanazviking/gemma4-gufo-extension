@@ -159,6 +159,24 @@ __device__ __forceinline__ uint4 DequantQ8Chunk(
   return DequantQ8Packed(packed, scale);
 }
 
+/// R7 round 3 (A): raw form of DequantQ8Chunk -- the eight codes of
+/// one chunk as one packed word plus the block fp16 scale, with no
+/// dequantization. Feeding the pair to DequantQ8Packed reproduces
+/// DequantQ8Chunk bit-for-bit; the int8-resident K tile stages this
+/// raw form in LDS and dequantizes on fragment load instead.
+__device__ __forceinline__ void LoadQ8ChunkRaw(
+    const std::uint8_t* cache_q8, std::size_t row_bytes, std::uint32_t slot,
+    std::uint32_t kvh, std::uint32_t per_head, std::uint32_t dim0,
+    std::uint64_t* packed, __half* scale) {
+  const std::uint8_t* row =
+      cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+  const std::size_t blk =
+      static_cast<std::size_t>(kvh) * (per_head / 32) + dim0 / 32;
+  __builtin_memcpy(scale, row + (row_bytes / 34) * 32 + blk * 2,
+                   sizeof(__half));
+  __builtin_memcpy(packed, row + blk * 32 + dim0 % 32, sizeof(*packed));
+}
+
 __device__ __forceinline__ v16h LoadFrag(const __half* p) {
   union {
     v16h f;
@@ -254,6 +272,20 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
 
   __shared__ __align__(16) __half k_lds[kKeys * kKStride];
   __shared__ __align__(16) __half vt_lds[D * kVtStride];
+  // R7 round 3 (A): int8-resident K tile for the q8 instantiations.
+  // The K tile is staged as raw q8 codes (one byte per dim, stride
+  // D + 16 for bank spread) plus one fp16 scale per (key, 32-block)
+  // in the tail of the same allocation -- the bf16 tile is twice
+  // the bytes, so the overlay adds no LDS. The QK loop dequantizes
+  // each fragment chunk on load with DequantQ8Packed, reproducing
+  // the staged bf16 tile bit-for-bit (each 16-dim chunk lies inside
+  // one 32-block, so one scale serves the whole fragment load).
+  // The V / vt_lds path is untouched, as is the f16 road.
+  constexpr std::uint32_t kKiStride = D + 16;
+  constexpr std::uint32_t kKBlocks = D / 32;
+  constexpr bool kInt8K = kQ8;
+  auto* const ki_lds = reinterpret_cast<std::uint8_t*>(k_lds);
+  auto* const ks_lds = reinterpret_cast<__half*>(k_lds) + kKeys * kKiStride / 2;
   // Unpadded score rows: the column writes and the softmax's reads of four
   // rows are both free of bank conflicts (17-float rows made the reads
   // conflict two ways).
@@ -365,6 +397,22 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   constexpr std::uint32_t kStage = kChunks / kThreads;
   uint4 k_next[kGlobal ? 1 : kStage];
   uint4 v_next[kStage];
+  // R7 round 3 (A): raw q8 codes + block scale per staged K chunk,
+  // carried from fetch to the int8 store_keys. For kGlobal the K
+  // tile is derived, so the V chunks (non-rotated dims) and the
+  // rotated chunk carry the raw forms instead.
+  std::uint64_t k_code[kStage] = {};
+  std::uint64_t v_code[kStage] = {};
+  std::uint64_t rot_code = 0;
+  __half k_cscale[kStage];
+  __half v_cscale[kStage];
+  __half rot_cscale;
+#pragma unroll
+  for (std::uint32_t j = 0; j < kStage; ++j) {
+    k_cscale[j] = __float2half(0.0F);
+    v_cscale[j] = __float2half(0.0F);
+  }
+  rot_cscale = __float2half(0.0F);
   // Derived keys (rope_pairs > 0): a thread's two chunks are dims d and
   // d + D / 2 of one key; rotated dims come from the rotated-dims K cache,
   // every other key dim is its value (the query carries the key weight).
@@ -480,6 +528,10 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
           __builtin_memcpy(&scale_b, &sbb, sizeof(sbb));
           v_next[0] = DequantQ8Packed(packed_a, scale_a);
           v_next[1] = DequantQ8Packed(packed_b, scale_b);
+          v_code[0] = packed_a;
+          v_code[1] = packed_b;
+          v_cscale[0] = scale_a;
+          v_cscale[1] = scale_b;
           if (rot_wave) {
             // R7-R4: fused dequant-on-load for the rotated-K store,
             // half-block form (audit: Phase 5 REDO R7 round 2 in
@@ -524,6 +576,8 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
             __half rscale;
             __builtin_memcpy(&rscale, &rs16, sizeof(rs16));
             k_rot = DequantQ8Packed(rpacked, rscale);
+            rot_code = rpacked;
+            rot_cscale = rscale;
           }
           return;
         }
@@ -558,6 +612,7 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
       const std::uint32_t d8 = chunk_d8(0);
       k_next[0] = make_uint4(0U, 0U, 0U, 0U);
       v_next[0] = make_uint4(0U, 0U, 0U, 0U);
+      k_code[0] = 0;
       const bool valid = position < block_hi;
       const bool loader = lane < 16U;
       const int src = static_cast<int>(loader ? lane : lane - 16U);
@@ -598,6 +653,8 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
         __builtin_memcpy(&kscale, &kb16, sizeof(kb16));
         __builtin_memcpy(&vscale, &vb16, sizeof(vb16));
         k_next[0] = DequantQ8Packed(pk, kscale);
+        k_code[0] = pk;
+        k_cscale[0] = kscale;
         v_next[0] = DequantQ8Packed(pv, vscale);
       }
       return;
@@ -608,8 +665,10 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
       const std::uint32_t d8 = chunk_d8(j);
       if constexpr (!kGlobal) {
         k_next[j] = make_uint4(0U, 0U, 0U, 0U);
+        k_code[j] = 0;
       }
       v_next[j] = make_uint4(0U, 0U, 0U, 0U);
+      v_code[j] = 0;
       if (position < block_hi) {
         const std::size_t slot = slot_of(position);
         if constexpr (!kGlobal) {
@@ -618,18 +677,31 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
             // launcher declines q8_0 derived keys outside the global
             // template, so here rope_pairs == 0 and the K row is the
             // plain per-head row QkvPost wrote (KV-05).
-            k_next[j] = DequantQ8Chunk(a.k_cache_q8, row_bytes_q8,
-                                       static_cast<std::uint32_t>(slot),
-                                       kv_head, D, d8);
+            if constexpr (kInt8K) {
+              LoadQ8ChunkRaw(a.k_cache_q8, row_bytes_q8,
+                             static_cast<std::uint32_t>(slot), kv_head, D, d8,
+                             &k_code[j], &k_cscale[j]);
+            } else {
+              k_next[j] = DequantQ8Chunk(a.k_cache_q8, row_bytes_q8,
+                                         static_cast<std::uint32_t>(slot),
+                                         kv_head, D, d8);
+            }
           } else {
             k_next[j] = *reinterpret_cast<const uint4*>(key_base[j] +
                                                         slot * key_stride[j]);
           }
         }
         if constexpr (kQ8) {
-          v_next[j] =
-              DequantQ8Chunk(a.v_cache_q8, row_bytes_q8,
-                             static_cast<std::uint32_t>(slot), kv_head, D, d8);
+          if constexpr (kInt8K && kGlobal) {
+            LoadQ8ChunkRaw(a.v_cache_q8, row_bytes_q8,
+                           static_cast<std::uint32_t>(slot), kv_head, D, d8,
+                           &v_code[j], &v_cscale[j]);
+            v_next[j] = DequantQ8Packed(v_code[j], v_cscale[j]);
+          } else {
+            v_next[j] = DequantQ8Chunk(a.v_cache_q8, row_bytes_q8,
+                                       static_cast<std::uint32_t>(slot),
+                                       kv_head, D, d8);
+          }
         } else {
           v_next[j] = *reinterpret_cast<const uint4*>(
               v_cache + slot * kv_stride +
@@ -640,8 +712,12 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
     if constexpr (kGlobal) {
       const std::uint32_t position = key0 + tid % kKeys;
       k_rot = make_uint4(0U, 0U, 0U, 0U);
+      rot_code = 0;
       if (rot_wave && position < block_hi) {
         if constexpr (kQ8) {
+          LoadQ8ChunkRaw(a.k_cache_q8, rot_row_bytes_q8, position, kv_head,
+                         2 * kGlobalPairs, (tid / kKeys) * 8, &rot_code,
+                         &rot_cscale);
           k_rot = DequantQ8Chunk(a.k_cache_q8, rot_row_bytes_q8, position,
                                  kv_head, 2 * kGlobalPairs, (tid / kKeys) * 8);
         } else {
@@ -658,6 +734,40 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   // into 32-bit words: lanes 2m and 2m + 1 hold keys 2m and 2m + 1 of the
   // same 8 dims, swap half of them, and each writes 4 dims' key pairs.
   const auto store_keys = [&] {
+    if constexpr (kInt8K) {
+      // Stage raw codes + per-block scales; the QK loop dequantizes
+      // on fragment load. Codes are exact copies of the cache codes
+      // (for kGlobal, of the V / rotated-K stores the derived key
+      // is built from), so the fragments are bit-identical.
+      const auto put = [&](std::uint32_t key, std::uint32_t d8,
+                           std::uint64_t code, __half scale) {
+        *reinterpret_cast<uint2*>(&ki_lds[key * kKiStride + d8]) =
+            make_uint2(static_cast<std::uint32_t>(code),
+                       static_cast<std::uint32_t>(code >> 32));
+        ks_lds[key * kKBlocks + d8 / 32] = scale;
+      };
+      if constexpr (kGlobal) {
+#pragma unroll
+        for (std::uint32_t j = 0; j < kStage; ++j) {
+          const std::uint32_t d8 = chunk_d8(j);
+          if (d8 % (D / 2) >= kGlobalPairs) {
+            put(chunk_key(j), d8, v_code[j], v_cscale[j]);
+          }
+        }
+        if (tid < kRotChunks) {
+          const std::uint32_t c = tid / kKeys;
+          const std::uint32_t d8 =
+              c < kGlobalPairs / 8 ? c * 8 : D / 2 + (c - kGlobalPairs / 8) * 8;
+          put(tid % kKeys, d8, rot_code, rot_cscale);
+        }
+      } else {
+#pragma unroll
+        for (std::uint32_t j = 0; j < kStage; ++j) {
+          put(chunk_key(j), chunk_d8(j), k_code[j], k_cscale[j]);
+        }
+      }
+      return;
+    }
 #pragma unroll
     for (std::uint32_t j = 0; j < kStage; ++j) {
       const std::uint32_t d8 = chunk_d8(j);
@@ -773,7 +883,28 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
       v8f s_acc = {};
 #pragma unroll
       for (std::uint32_t ks = 0; ks < kSliceSteps; ++ks) {
-        const v16h k_frag = LoadFrag(&k_lds[sub * kKStride + dim0 + ks * 16]);
+        const v16h k_frag = [&] {
+          if constexpr (kInt8K) {
+            const std::uint32_t d = dim0 + ks * 16;
+            const uint4 codes =
+                *reinterpret_cast<const uint4*>(ki_lds + sub * kKiStride + d);
+            const __half sc = ks_lds[sub * kKBlocks + d / 32];
+            union {
+              v16h f;
+              uint4 u[2];
+            } cvt;
+            cvt.u[0] =
+                DequantQ8Packed(static_cast<std::uint64_t>(codes.x) |
+                                    (static_cast<std::uint64_t>(codes.y) << 32),
+                                sc);
+            cvt.u[1] =
+                DequantQ8Packed(static_cast<std::uint64_t>(codes.z) |
+                                    (static_cast<std::uint64_t>(codes.w) << 32),
+                                sc);
+            return cvt.f;
+          }
+          return LoadFrag(&k_lds[sub * kKStride + dim0 + ks * 16]);
+        }();
         s_acc = Wmma(q_frag[ks], k_frag, s_acc);
       }
 #pragma unroll

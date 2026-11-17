@@ -1441,3 +1441,75 @@ MemAvailable was ~124,413,940 kB at keeper tick start
 (re-checked ~124,409,608 kB this tick), no live
 build/bench, Ollama :11434 and gufo-resident untouched,
 Phase 6 / KV-13 does NOT start, no quantized default.
+
+## Phase 5 REDO R7 round 3 -- (A) int8-resident K tile IMPLEMENTED (2026-11-17, builder tick 17:59 EST)
+
+Implementation (hip/attention_wmma.hip.cpp only), per the
+round-3 audit's bounded experiment (A), all q8 instantiations
+(global derived-K, sliding d256, generic plain):
+- K stays int8 in LDS: the tile is staged as raw q8 codes
+  (1 B/dim, stride D + 16) plus one fp16 scale per
+  (key, 32-block), overlaid on the existing bf16 k_lds
+  allocation (int8 + scales are under half its bytes, so no
+  added LDS). The QK loop dequantizes each 16-dim fragment
+  chunk on load with DequantQ8Packed -- each chunk lies
+  inside one 32-block, so one scale serves the whole load,
+  and each K element is dequantized exactly once (waves
+  partition the head dim). V / vt_lds path untouched; the
+  f16 road is untouched.
+- Raw forms ride through fetch: LoadQ8ChunkRaw (raw twin of
+  DequantQ8Chunk) for the generic and global partial-tile
+  paths; the sliding half-block loader's existing raw words;
+  the global full-tile V block words and the R7-R4 rotated-K
+  half-block words (the derived K's non-rotated dims ARE the
+  V store's codes, the rotated dims the rotated store's --
+  both staged raw with their own block scales, so the
+  derived tile is reproduced exactly). Partial tiles keep
+  the exact per-chunk bounds logic; invalid chunks stage
+  zero codes.
+- Bit-identity argument: staged bf16 K was exactly
+  code * block-scale rounded to binary16 (DequantQ8Packed);
+  the int8 road stores the same codes + scale and applies
+  the same DequantQ8Packed at fragment load. No arithmetic,
+  accumulation order, or WMMA operand changes.
+
+Verification (2026-11-17, device; binary result ->
+/nix/store/hq5zgb1nq3k13gqbnrl5aw39a48r18kd-gufo-0-unstable-4938016;
+MemAvailable ~124 GiB at build, probes and both matrix
+starts; Ollama :11434 and gufo-resident.service untouched):
+- nix build clean (detached, exit 0); clang-format clean on
+  the one touched file.
+- Host kv_cache_format test PASS, roundtrip numbers
+  identical to R2 (K 0.010000 / 48.25 dB, V 0.010000 /
+  48.15 dB, ring 0.006234, derived-K 0.015822 / 47.14 dB).
+- Probes (labels r7a-q8 / r7a-f16, same binary
+  result/bin/gufo, GUFO_KV_CACHE_TYPE per label): all five
+  byte-identical q8_0 vs same-binary f16, Model Load timing
+  line excluded (FACT-1 Paris, FACT-2 Au, FACT-3 366,
+  COH-1 same text, LONG-1 47-12-89), verified by direct
+  diff this tick. Banking rule (probes identical + host
+  PASS) is met.
+- Prefill medians (tok/s, 5 runs, warmup discarded):
+  q8 pp512 2195.67 (2178.98-2206.63), pp4096 2654.13
+  (2600.91-2709.10), pp16384 2071.58 (2031.48-2099.67);
+  f16 pp512 2206.22, pp4096 2906.29, pp16384 2514.42.
+  Deltas: pp512 -0.48 pct, pp4096 -8.68 pct,
+  pp16384 -17.61 pct. Decode spot: q8 tg 36.59 / 33.24 /
+  32.24 vs f16 42.10 / 40.52 / 39.15.
+- HONEST VERDICT: (A) as implemented is SLOWER than the
+  staged-bf16 road it replaced, and slower than the R4
+  state at pp4096 / pp16384 (gate-run q8 2692.32 /
+  2421.44). Halving K LDS traffic did not pay for moving
+  dequant into the QK fragment path (per-fragment scale
+  LDS load + dequant latency in front of every WMMA, on
+  the critical path). The numbers are recorded as
+  measured; NO Phase 5 gate pass is claimed and no R5
+  gate run was attempted on this state.
+
+Next: a separate R5-protocol gate run is NOT the obvious
+next step on a state already slower at spot lengths; the
+next R7 round should decide from this evidence -- e.g.
+revert (A) to the R4 staged road and take R6 experiments,
+or attack the fragment-path latency directly -- recorded
+before it starts. Phase 6 (KV-13) does NOT start. No
+quantized mode becomes any default.
