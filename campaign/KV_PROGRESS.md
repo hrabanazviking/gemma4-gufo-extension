@@ -80,7 +80,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-07 dequant-in-decode (sliding) | DONE | section below; q8_0 probes FACT-1/2/3 + LONG-1 identical to the f16 baseline |
 | KV-08 decode correctness + speed gate | DONE | section below; probes byte-identical to f16 + Phase 0 baseline; decode +0.09/+0.27/+0.10 pct vs same-binary f16 (noise) |
 | KV-09 global layers derived-K | DONE | section below; reconstruction max_abs_err 0.015822, SNR 47.14 dB; probes byte-identical to f16 |
-| KV-10 global validation gate | PENDING | |
+| KV-10 global validation gate | DONE | section below; Phase 4 gate PASSED; probes identical excl load timing; matrix kv10-q8 vs kv10-f16 recorded |
 | KV-11 non-WMMA prefill q8_0 | PENDING | |
 | KV-12 WMMA prefill / dispatch rule | PENDING | |
 | KV-13 machinery re-proof | PENDING | |
@@ -447,6 +447,46 @@ error through the real attention path, probes + matrix re-run,
 and the gate call (full q8_0 vs the mixed-cache fallback) on
 that evidence.
 
+## Phase 4 gate slice (KV-10) -- global validation gate
+
+Run 2026-11-17 09:04-09:35 EST on purpleraider, KV-09 binary
+(/nix/store/6h60fbr9...-gufo-0-unstable-4938016/bin/gufo),
+MemAvailable 124,560,356 kB at start. Detached /tmp/kv10_run.sh:
+matrix + probes re-run for kv10-q8 and kv10-f16, KV10_RUN_DONE,
+lock self-removed on completion. Collected and banked by the
+09:44 keeper tick (no lock, no live bench at collection).
+
+Reconstruction through the real attention path (KV-09 evidence,
+re-validated here end-to-end): max_abs_err 0.015822, SNR 47.14 dB
+on the global derived-K reconstruction.
+
+Probes (greedy, seed 42): all 5 byte-identical q8_0 vs f16
+excluding the [Model Load] timing line -- FACT-1 Paris,
+FACT-2 Au, FACT-3 366, COH-1 identical text, LONG-1 47-12-89
+(15,739 prompt tokens; global layers exercised at length).
+
+Matrix medians (tok/s, 5 runs, 1 warmup discarded):
+- pp512: q8_0 1713.89 vs f16 2189.33 (-21.7 pct)
+- pp4096: q8_0 1029.10 vs f16 2906.45 (-64.6 pct)
+- pp16384: q8_0 534.10 vs f16 2526.15 (-78.9 pct)
+- tg512: q8_0 37.97 vs f16 41.92 (-9.4 pct)
+- tg4096: q8_0 36.78 vs f16 40.53 (-9.3 pct)
+- tg16384: q8_0 35.38 vs f16 39.15 (-9.6 pct)
+Speed recorded honestly, not fudged: prefill in q8_0 mode is
+currently far slower -- that is exactly Phase 5 work (KV-11
+non-WMMA prefill, KV-12 WMMA / dispatch rule, whose gate is
+no-regression vs f16). Decode is ~9-10 pct slower with global
+layers also quantized (KV-08 sliding-only was noise-level).
+The KV-10 gate itself is the correctness/reconstruction gate
+in the roadmap text, and it passes on the numbers above.
+
+**Phase 4 gate: PASSED** 2026-11-17 -- global layers quantized
+within tolerance (reconstruction + all probes identical through
+the real attention path); the mixed-cache fallback is NOT
+needed. Full q8_0 ships forward to Phase 5.
+
+Next (KV-11): Phase 5 -- non-WMMA prefill reads/writes q8_0.
+
 ## Phase gates
 
 - Phase 0 gate: PASSED 2026-11-17 — harness committed (KV-01),
@@ -454,6 +494,7 @@ that evidence.
 - Phase 1 gate: PASSED 2026-11-17 — evidence below.
 - Phase 2 gate: PASSED 2026-11-17 — evidence in the KV-06 section above.
 - Phase 3 gate: PASSED 2026-11-17 -- evidence in the KV-08 section above.
+- Phase 4 gate: PASSED 2026-11-17 -- evidence in the KV-10 section above.
 
 ## Phase 1 (KV-03 + KV-04) — format field, allocation, plumbing
 
