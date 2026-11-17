@@ -16,7 +16,7 @@ while IFS= read -r line; do
   case "$line" in ''|\#*) continue;; esac
   id="${line%% :: *}"; prompt="${line##* :: }"
   "$GUFO" prompt -m "$MODEL" -p "$prompt" -t 0 -s 42 --think off \
-    -n 96 --no-display-prompt > "$OUT/$id.txt" 2>"$OUT/$id.err"
+    --context 32768 -n 96 --no-display-prompt > "$OUT/$id.txt" 2>"$OUT/$id.err"
 done < "$HERE/probes.txt"
 
 # Long-context needle probe (~16k tokens of filler, fact in the middle).
@@ -34,6 +34,6 @@ parts = [filler * 650, needle, filler * 650,
 open(sys.argv[1], "w").write("".join(parts))
 PYEOF
 "$GUFO" prompt -m "$MODEL" -f "$LONGTXT" -t 0 -s 42 --think off \
-  -n 32 --no-display-prompt > "$OUT/LONG-1.txt" 2>"$OUT/LONG-1.err"
+  --context 32768 -n 32 --no-display-prompt > "$OUT/LONG-1.txt" 2>"$OUT/LONG-1.err"
 rm -f "$LONGTXT"
 echo "probes done: $OUT"
