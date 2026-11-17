@@ -75,7 +75,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-02 f16 baseline | DONE | table below; raw logs results/baseline-f16/ (device-side) |
 | KV-03 format field + allocation | DONE | ff8cf4f; section below |
 | KV-04 GUFO_KV_CACHE_TYPE plumbing | DONE | f427c09 + format fix 5f59d2e; section below |
-| KV-05 quantize-on-write K (sliding) | PENDING | |
+| KV-05 quantize-on-write K (sliding) | DONE | section below; roundtrip max_abs_err 0.010000, SNR 48.25 dB |
 | KV-06 quantize-on-write V + ring | PENDING | |
 | KV-07 dequant-in-decode (sliding) | PENDING | |
 | KV-08 decode correctness + speed gate | PENDING | |
@@ -132,6 +132,62 @@ Harness lessons (paid for once, recorded so nobody pays twice):
 - Size long-probe filler by measured tokens (usage.prompt_tokens),
   never by character estimates: a first "16k" draft measured
   36,459 tokens and overflowed with a clean 400.
+
+## Phase 2 first slice (KV-05) -- q8_0 K quantize-on-write, sliding
+
+What landed:
+- `kv_cache_format.hpp`: host reference for the device store --
+  `QuantizeQ8_0Block` / `DequantizeQ8_0Block` and the row forms
+  `QuantizeQ8_0Row` / `DequantizeQ8_0Row` (ggml q8_0 layout: 32
+  int8 codes + fp16 scale per 32 values, scale = amax / 127), plus
+  `FloatToFp16Bits` / `Fp16BitsToFloat` for the block scales.
+- `hip/kernels.hpp` + `hip/kernels.hip.cpp`: `QkvPostArgs` gains
+  `k_cache_q8`. When set (and rotated_pairs == 0), QkvPost stores
+  the K row for a slot as q8_0 blocks at slot * KvCacheRowBytes(
+  kv_heads * head_dim, kQ8_0), one 34-byte block per 32 values in
+  row order. In the kernel one block lies in one wave (lane holds
+  dim 32 * b + lane), so WaveMax gives the block amax, each lane
+  writes its own code, and lane 0 writes the fp16 scale -- the same
+  values the host reference computes. The slot comes from the
+  existing key/ring computation, so the store addresses linear and
+  ring slots identically; V still stores binary16 in this slice.
+- `hip/executor.cpp`: Forward passes `k_cache_q8` for sliding
+  layers when `cache.format == kQ8_0`. Honest scoping: this is
+  unreachable today, because CreateCache still refuses q8_0 --
+  deliberately. The V store (KV-06) and the decode read path
+  (KV-07) are not built, so no end-to-end q8_0 session can start
+  and no consumer can read a half-converted cache. The refusal
+  message now says exactly that. f16 behavior is unchanged (the
+  f16 store branch is the old code, moved under an else).
+- Test: `tests/kv_cache_format_test.cpp` extended (same registered
+  `gemma4.kv_cache_format` test): fp16 bit roundtrips, block
+  layout pins (constant block -> codes 127, scale fp16(1/127) at
+  bytes 32..33; zero block exact), and the K-row roundtrip below.
+
+Verification (2026-11-17, device):
+- Standalone compile of the registered test (g++ -std=c++20
+  -Wall -Wextra, headers only) -> PASS. Roundtrip of a 2048-value
+  sliding K row (deterministic pseudo-random values in [-2, 2],
+  one outlier block with amax 8): **max abs error 0.010000**
+  (the outlier block's own small values, quantized at its scale
+  8/127), **max abs error outside the outlier block 0.008366**,
+  **SNR 48.25 dB**. Bounds asserted in the test: max <= 0.04,
+  calm blocks <= 0.012, SNR >= 30 dB. These are the recorded
+  error bounds for the Phase 2 gate's K half; KV-06 adds V.
+- nix build of the KV-05 tree: clean (detached, ~4 min wall;
+  store path qsdj2l6...-gufo-0-unstable-4938016). clang-format
+  clean on all touched files.
+- f16 spot check on the KV-05 binary: FACT-1 probe answers
+  `Paris`, identical to the KV-02 baseline. `--kv-cache-type
+  q8_0` prints the format report line, then the session refusal
+  naming KV-05/KV-06/KV-07 -- no silent q8_0 mode.
+- Installed profile and gufo-resident.service untouched;
+  Ollama (:11434) untouched.
+
+Next (KV-06): V rows quantize-on-write + the ring-buffer layout
+proof for both stores; the Phase 2 gate closes there (no write
+path still writing raw bf16 in q8_0 mode). KV-07 then builds the
+decode read path, which is what may lift the CreateCache refusal.
 
 ## Phase gates
 
