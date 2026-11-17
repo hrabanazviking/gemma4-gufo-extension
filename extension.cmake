@@ -188,6 +188,8 @@ endfunction()
 
 _gemma4_test(config "cpu"
   SOURCES tests/config_test.cpp LINK_LIBRARIES gufo_gemma4)
+_gemma4_test(kv_cache_format "cpu"
+  SOURCES tests/kv_cache_format_test.cpp LINK_LIBRARIES gufo_gemma4)
 _gemma4_test(cycle_trace "cpu;speculative"
   SOURCES tests/cycle_trace_test.cpp LINK_LIBRARIES gufo_gemma4)
 _gemma4_test(draft_policy "cpu;speculative"

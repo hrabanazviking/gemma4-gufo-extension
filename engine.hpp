@@ -19,6 +19,7 @@
 #include "cycle_trace.hpp"
 #include "draft_policy.hpp"
 #include "draft_vocab.hpp"
+#include "kv_cache_format.hpp"
 #include "mtp_sampling.hpp"
 #include "prefill_weights.hpp"
 #include "prompt_lookup.hpp"
@@ -69,6 +70,8 @@ struct ModelOptions {
   std::string draft_trace_path;
   /// Prefill copies of the dense projections (memory for prefill speed).
   PrefillWeights prefill_weights = PrefillWeights::kOff;
+  /// KV cache storage format (--kv-cache-type / GUFO_KV_CACHE_TYPE).
+  KvCacheFormat kv_cache_format = KvCacheFormat::kF16;
 };
 
 class Session;

@@ -16,6 +16,7 @@
 #include "hip/candidates.hpp"
 #include "hip/device_model.hpp"
 #include "hip/kernels.hpp"
+#include "kv_cache_format.hpp"
 
 namespace gufo::models::gemma4 {
 struct MtpCandidateLogits;
@@ -53,6 +54,9 @@ struct KvCache {
   std::size_t bytes{0};
   std::uint32_t max_context{0};
   std::uint32_t ring{0};
+  /// Storage format of the K/V regions below; every consumer of the
+  /// cache honors it (KvCacheFormatName gives its text form).
+  KvCacheFormat format{KvCacheFormat::kF16};
   /// Per layer, binary16: whole keys, or their rotated dims where keys are
   /// derived from V (Executor::KeyWidths).
   std::vector<std::uint16_t*> k;
@@ -93,7 +97,8 @@ public:
   /// `max_rows` bounds one forward (prefill chunk); `max_logit_rows` bounds
   /// how many rows of one forward may request logits.
   Executor(const DeviceModel& model, std::uint32_t max_rows,
-           std::uint32_t max_logit_rows, std::uint32_t max_context);
+           std::uint32_t max_logit_rows, std::uint32_t max_context,
+           KvCacheFormat kv_format = KvCacheFormat::kF16);
   ~Executor();
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
@@ -102,11 +107,12 @@ public:
       const Config& config, const Config* draft, std::uint32_t vocab,
       std::size_t max_cols, std::size_t max_half_cols, std::uint32_t max_rows,
       std::uint32_t max_logit_rows, std::uint32_t max_context);
-  /// Per-session cache bytes for per-layer K row widths (KeyWidths).
+  /// Per-session cache bytes for per-layer K row widths (KeyWidths),
+  /// with K/V regions sized in `format`.
   [[nodiscard]] static std::size_t CacheBytes(
       const Config& config, std::uint32_t max_context, std::uint32_t ring,
       const std::vector<std::uint32_t>& key_widths, std::uint32_t vocab,
-      std::size_t draft_table_bytes);
+      std::size_t draft_table_bytes, KvCacheFormat format);
   /// Values per K cache row: the whole K, or only the rotated dims where one
   /// projection feeds K and V (K = rope(k_norm * V)).
   [[nodiscard]] static std::vector<std::uint32_t> KeyWidths(
@@ -246,6 +252,9 @@ public:
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
   [[nodiscard]] std::uint32_t max_rows() const noexcept { return max_rows_; }
   [[nodiscard]] std::uint32_t ring() const noexcept { return ring_; }
+  [[nodiscard]] KvCacheFormat kv_format() const noexcept {
+    return kv_format_;
+  }
   [[nodiscard]] const std::vector<std::uint32_t>& key_widths() const noexcept {
     return key_widths_;
   }
@@ -296,6 +305,7 @@ private:
   std::uint32_t max_context_;
   std::uint32_t ring_;
   std::vector<std::uint32_t> key_widths_;
+  KvCacheFormat kv_format_{KvCacheFormat::kF16};
   hipStream_t stream_{nullptr};
   ContinuationFences* fences_{nullptr};
   std::vector<ContinuationHooks*> writers_;

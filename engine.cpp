@@ -313,7 +313,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     // chunk (Session::Extend).
     m->executor_ = std::make_unique<rocm::Executor>(
         *m->device_, options.prefill_chunk + rocm::kSplitRows,
-        options.max_logit_rows, m->options_.max_context);
+        options.max_logit_rows, m->options_.max_context,
+        options.kv_cache_format);
   } catch (const std::exception& e) {
     Fail(error_msg, e.what());
     return nullptr;
@@ -370,7 +371,8 @@ std::size_t Model::ResidentBytes() const noexcept {
 std::size_t Model::SessionBytes(std::uint32_t context) const noexcept {
   return rocm::Executor::CacheBytes(config(), context, executor_->ring(),
                                     executor_->key_widths(), VocabSize(),
-                                    executor_->draft_table_bytes());
+                                    executor_->draft_table_bytes(),
+                                    executor_->kv_format());
 }
 
 std::size_t Model::SessionRingSlots() const noexcept {

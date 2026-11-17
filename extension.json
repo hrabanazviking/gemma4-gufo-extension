@@ -66,6 +66,7 @@
     "gufo_gemma4_text":               {"requires": ["hip"]},
     "gufo_gemma4_reference":          {"requires": ["testing"]},
     "gemma4_config_test":             {"requires": ["testing"], "role": "test"},
+    "gemma4_kv_cache_format_test":    {"requires": ["testing"], "role": "test"},
     "gemma4_cycle_trace_test":        {"requires": ["testing"], "role": "test"},
     "gemma4_draft_policy_test":       {"requires": ["testing"], "role": "test"},
     "gemma4_draft_vocab_test":        {"requires": ["testing"], "role": "test"},

@@ -204,15 +204,17 @@ std::size_t Executor::CacheBytes(const Config& c, std::uint32_t max_context,
                                  std::uint32_t ring,
                                  const std::vector<std::uint32_t>& key_widths,
                                  std::uint32_t vocab,
-                                 std::size_t draft_table_bytes) {
-  std::size_t bytes = 0;
+                                 std::size_t draft_table_bytes,
+                                 KvCacheFormat format) {
+  std::vector<KvLayerShape> layers;
+  layers.reserve(c.num_layers);
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
-    const std::size_t slots =
+    const std::uint32_t slots =
         c.IsSliding(l) ? std::min(ring, max_context) : max_context;
-    bytes += AlignUp(slots * key_widths[l] * sizeof(std::uint16_t)) +
-             AlignUp(slots * c.KvDim(l) * sizeof(std::uint16_t));
+    layers.push_back(KvLayerShape{slots, key_widths[l], c.KvDim(l)});
   }
-  return bytes + AlignUp(std::size_t{c.hidden_size} * sizeof(float)) +
+  return KvCacheStorageBytes(layers, format) +
+         AlignUp(std::size_t{c.hidden_size} * sizeof(float)) +
          AlignUp(std::size_t{kSplitRows} * c.hidden_size * sizeof(float)) +
          AlignUp(std::size_t{vocab} * sizeof(float)) +
          AlignUp(draft_table_bytes);
@@ -240,13 +242,15 @@ std::vector<std::uint32_t> Executor::KeyWidths(const DeviceModel& model) {
 }
 
 Executor::Executor(const DeviceModel& model, std::uint32_t max_rows,
-                   std::uint32_t max_logit_rows, std::uint32_t max_context)
+                   std::uint32_t max_logit_rows, std::uint32_t max_context,
+                   KvCacheFormat kv_format)
     : model_(model),
       max_rows_(max_rows),
       max_logit_rows_(max_logit_rows),
       max_context_(max_context),
       ring_(RingSlots(model.config(), max_rows)),
-      key_widths_(KeyWidths(model)) {
+      key_widths_(KeyWidths(model)),
+      kv_format_(kv_format) {
   const Layout l =
       Plan(model.config(), model.has_draft() ? &model.draft().config : nullptr,
            model.vocab_size(), model.max_cols(), model.max_half_cols(),
@@ -411,11 +415,26 @@ std::unique_ptr<KvCache> Executor::CreateCache(std::uint32_t max_context,
     }
     return nullptr;
   }
+  if (kv_format_ != KvCacheFormat::kF16) {
+    // Phase 1 of the KV campaign: the format is parsed, reported and
+    // sized (CacheBytes), but the quantized write/read paths are not
+    // built yet. Refuse loudly rather than serve a cache whose rows
+    // no consumer can read.
+    if (error_msg != nullptr) {
+      *error_msg = "KV cache format '" +
+                   std::string(KvCacheFormatName(kv_format_)) +
+                   "' is not built yet (KV campaign Phase 1: format and "
+                   "allocation only); use f16";
+    }
+    return nullptr;
+  }
   auto cache = std::make_unique<KvCache>();
   cache->max_context = max_context;
   cache->ring = ring_;
+  cache->format = kv_format_;
   cache->bytes = CacheBytes(c, max_context, ring_, key_widths_,
-                            model_.vocab_size(), draft_table_bytes());
+                            model_.vocab_size(), draft_table_bytes(),
+                            kv_format_);
   if (hip::AllocateDevice(&cache->allocation, cache->bytes) != hipSuccess) {
     if (error_msg != nullptr) {
       *error_msg = "KV cache allocation failed (" +
@@ -428,12 +447,12 @@ std::unique_ptr<KvCache> Executor::CreateCache(std::uint32_t max_context,
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
     const std::size_t slots =
         c.IsSliding(l) ? std::min(ring_, max_context) : max_context;
-    const std::size_t bytes =
-        AlignUp(slots * c.KvDim(l) * sizeof(std::uint16_t));
+    const std::size_t v_bytes =
+        AlignUp(slots * KvCacheRowBytes(c.KvDim(l), kv_format_));
     cache->k.push_back(reinterpret_cast<std::uint16_t*>(at));
-    at += AlignUp(slots * key_widths_[l] * sizeof(std::uint16_t));
+    at += AlignUp(slots * KvCacheRowBytes(key_widths_[l], kv_format_));
     cache->v.push_back(reinterpret_cast<std::uint16_t*>(at));
-    at += bytes;
+    at += v_bytes;
   }
   const std::size_t hidden_bytes =
       AlignUp(std::size_t{c.hidden_size} * sizeof(float));
