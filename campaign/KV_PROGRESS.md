@@ -1544,3 +1544,52 @@ Tick state: banked head verified 3d4aa11 == fork
 ls-remote, no prior lock, no live build/bench,
 MemAvailable ~124 GiB, Ollama :11434 and
 gufo-resident.service untouched.
+
+## Phase 5 REDO R7 round 4 -- (A) REVERTED to R4 staged road (2026-11-17, builder tick 18:38 EST)
+
+Per the round-4 decision record above: experiment (A)
+(int8-resident K tile, banked 3d4aa11) is reverted.
+3d4aa11 touched only hip/attention_wmma.hip.cpp (plus
+this ledger); that one file was restored from 4209ef2
+(the R4 staged-bf16 state). The (A) commit stays in
+history as evidence -- no history rewrite. Verified:
+git diff 4209ef2 for hip/attention_wmma.hip.cpp is
+EMPTY after the restore, so the file is byte-identical
+to the R4 state.
+
+Verification (2026-11-17, device; binary result ->
+/nix/store/9dbpwywjfkjwvg890hl0yyqj8mljq1kq-gufo-0-unstable-4938016;
+MemAvailable ~124 GiB at build and probes; Ollama
+:11434 and gufo-resident.service untouched):
+- nix build clean (detached, exit 0).
+- Host kv_cache_format test PASS, roundtrip numbers
+  identical to R2: K 0.010000 / 48.25 dB, V 0.010000 /
+  48.15 dB, ring 0.006234, derived-K 0.015822 / 47.14 dB.
+- Probes (labels r7revert-q8 / r7revert-f16, same binary
+  result/bin/gufo, GUFO_KV_CACHE_TYPE per label): all
+  five byte-identical q8_0 vs same-binary f16, Model
+  Load timing line excluded (FACT-1 Paris, FACT-2 Au,
+  FACT-3 366, COH-1 same text, LONG-1 47-12-89),
+  verified by direct diff this tick. Banking rule for
+  the revert (probes byte-identical + host PASS) is met.
+- NO Phase 5 gate pass is claimed; no R5 gate run was
+  attempted on the reverted state. Prefill spot medians
+  were not re-run this tick (optional; the R4 gate-run
+  numbers stand as the record for this state).
+
+Next step: R6 bounded experiments, each with its
+decision rule recorded before it starts:
+- E1: fused-V scale-folding, ONLY in the variant that
+  reproduces staged bf16 rounding of dequantized V.
+  Decision rule: bank only if probes byte-identical +
+  host PASS; claim a gate only via a separate R5 run.
+- E2: int8-WMMA QK spike is microbenchmark-only.
+  Decision rule: microbench numbers only; no kernel
+  integration and no banking of a QK change from E2
+  without a new decision record.
+Phase 6 (KV-13) does NOT start. No quantized mode
+becomes any default.
+
+Tick state: MemAvailable ~124 GiB, Ollama :11434 and
+gufo-resident untouched, lock held during work and
+removed at tick end.
