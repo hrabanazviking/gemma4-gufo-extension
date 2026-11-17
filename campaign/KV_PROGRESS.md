@@ -1513,3 +1513,34 @@ revert (A) to the R4 staged road and take R6 experiments,
 or attack the fragment-path latency directly -- recorded
 before it starts. Phase 6 (KV-13) does NOT start. No
 quantized mode becomes any default.
+
+## Phase 5 REDO R7 round 4 -- DECISION RECORD (2026-11-17, keeper tick 18:32 EST)
+
+Decision, recorded BEFORE the next implementation round
+starts, per R6 / R7 loop law:
+
+- REVERT experiment (A) (int8-resident K tile, banked
+  3d4aa11) to the R4 staged-bf16 road (state 4209ef2 /
+  gate-run a2be8fe) as the next implementation slice.
+  Reason: (A) measured slower than the staged road it
+  replaced at pp4096 (2654.13 vs gate-run 2692.32) and
+  pp16384 (2071.58 vs 2421.44), and slower than same-
+  binary f16 at all three lengths (-0.48 / -8.68 /
+  -17.61 pct). Halving K LDS traffic did not pay for
+  dequant latency on the QK fragment critical path.
+  The (A) commit stays in history as evidence; the
+  revert restores the best-known q8 prefill state.
+- After the revert is banked with probes byte-identical
+  + host PASS (no gate claim on the revert itself), the
+  following round takes R6 bounded experiments, each
+  with its decision rule recorded before it starts:
+  E1 fused-V scale-folding only in the variant that
+  reproduces staged bf16 rounding of dequantized V;
+  E2 int8-WMMA QK spike is microbenchmark-only.
+- No R5 gate run on the (A) state. Phase 6 (KV-13)
+  does NOT start. No quantized mode becomes any default.
+
+Tick state: banked head verified 3d4aa11 == fork
+ls-remote, no prior lock, no live build/bench,
+MemAvailable ~124 GiB, Ollama :11434 and
+gufo-resident.service untouched.
