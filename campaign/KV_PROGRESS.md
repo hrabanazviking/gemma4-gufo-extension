@@ -800,3 +800,57 @@ of twice. Next tick: R2-global step 1 -- layout flag +
 writer + scale plane, decode/split readers switched in
 the same slice, kv_cache_format test updated and PASS,
 probes byte-identical before any speed claim.
+
+## Phase 5 REDO R2-global step 1 -- versioned split-scale-plane layout (2026-11-17, builder tick 13:03 EST)
+
+Layout v2 landed, writer and ALL readers switched in one slice,
+per the R1 decision. No fused loader yet (that is step 2, written
+against this layout); no speed claim this step -- the gate is
+byte identity, and it passes.
+
+- Versioning: `KvQ8Layout` in kv_cache_format.hpp -- v1
+  kInterleavedV1 (superseded ggml 34-byte blocks, scale inline at
+  bytes [32,34)), v2 kSplitScaleV2 = kKvQ8LayoutCurrent;
+  `KvCacheQ8LayoutVersion(format)` reports 2 for q8_0, 0 else.
+  Caches never outlive the process, so no migration exists; the
+  flag makes any future layout change an explicit version bump.
+- New layout (per row, per token): int8 payload contiguous --
+  32 bytes per 32-value block, blocks in row order (per head,
+  then d_block) -- followed by a separate fp16 scale plane,
+  2 bytes per block indexed [token][head][d_block]. Host helpers
+  Q8_0PayloadOffset / Q8_0ScaleOffset / Q8_0BlockCount;
+  QuantizeQ8_0Block now emits codes and scale separately;
+  QuantizeQ8_0Row / DequantizeQ8_0Row place them in the planes.
+  Row totals UNCHANGED (blocks * 34): every KvCacheRowBytes /
+  storage figure in the test stands as pinned.
+- Device: hip/kernels.hip.cpp gains Q8RowBytes / Q8BlockCodes /
+  Q8BlockScale mirrors. Switched: QkvPost writer (K, V and the
+  packed rotated-K stores), DequantQ8Lane / DequantQ8PackedLane
+  (decode AttendKeys + own-key step), the KV-11 split-kernel
+  readers (non-staged load lambda, staged V tile, staged
+  rotated-K load). hip/attention_wmma.hip.cpp DequantQ8Chunk
+  reads codes from the payload plane and the scale from the
+  scale plane (row block count = row_bytes / 34). kernels.hpp
+  layout docs updated. MoveKey / snapshots copy whole rows
+  opaquely and needed no change.
+- Verification (2026-11-17, device; binary result ->
+  /nix/store/j9gncxvl...-gufo-0-unstable-4938016, derivation
+  pdalz5ri... from this tree; MemAvailable ~124 GiB):
+  clang-format clean on all five touched files. Host
+  kv_cache_format test PASS with roundtrip numbers IDENTICAL
+  to the old layout (K 0.010000 / 48.25 dB, V 0.010000 /
+  48.15 dB, ring 0.006234, derived-K 0.015822 / 47.14 dB) --
+  the arithmetic is unchanged, only the byte arrangement.
+  Probes (full harness, labels r2s1-q8 / r2s1-f16, results
+  device-side, untracked per convention): all five answers
+  byte-identical q8_0 vs same-binary f16, model-load timing
+  line excluded as before -- FACT-1 Paris, FACT-2 Au, FACT-3
+  366, COH-1 identical text, LONG-1 47-12-89 -- and identical
+  to the KV-12b answers recorded on layout v1. This re-proves
+  the Phases 2-4 decode/validation spot gates on layout v2.
+  Installed profile and gufo-resident.service untouched;
+  Ollama (:11434) untouched.
+
+Next: R2-global step 2 -- the fused dequant-on-load loader
+written against this layout (global d512 first), then the R5
+gate run under the raised bar.

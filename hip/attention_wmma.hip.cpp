@@ -48,23 +48,30 @@ __device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
 /// row stride `row_bytes`) into one 16-byte chunk of binary16, the
 /// staged-tile transport the WMMA kernel consumes. dim0 is a multiple
 /// of 8, so the eight values lie inside one 32-value q8_0 block and
-/// share its fp16 scale: value = int8 code * scale, rounded to
+/// share its fp16 scale (layout v2: codes in the row's payload
+/// plane, the scale in its separate scale plane): value = int8
+/// code * scale, rounded to
 /// binary16 -- the same dequantized tile the non-WMMA paths stage
 /// (KV-07/KV-09), so a prefill row computes what decode computes.
 __device__ __forceinline__ uint4 DequantQ8Chunk(
     const std::uint8_t* cache_q8, std::size_t row_bytes, std::uint32_t slot,
     std::uint32_t kvh, std::uint32_t per_head, std::uint32_t dim0) {
-  const std::uint8_t* block =
-      cache_q8 + static_cast<std::size_t>(slot) * row_bytes +
-      (static_cast<std::size_t>(kvh) * (per_head / 32) + dim0 / 32) * 34;
-  const __half scale = *reinterpret_cast<const __half*>(block + 32);
+  // Layout v2 (R2-global step 1): the row's payload plane holds
+  // every block's codes contiguously; the scale plane follows it.
+  // row_bytes is the whole row, so its block count is row_bytes /
+  // 34 and the scale plane starts at blocks * 32.
+  const std::uint8_t* row =
+      cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+  const std::size_t blk =
+      static_cast<std::size_t>(kvh) * (per_head / 32) + dim0 / 32;
+  const __half scale =
+      *reinterpret_cast<const __half*>(row + (row_bytes / 34) * 32 + blk * 2);
   // KV-12b: one packed 8-byte load for the chunk's eight codes
-  // instead of eight byte loads (block starts are 34-byte
-  // multiples, so the load goes through memcpy and stays
-  // alignment-safe); codes, scale and products are unchanged,
-  // so the staged tile is bit-for-bit identical.
+  // instead of eight byte loads (through memcpy, alignment-safe
+  // at any dim0); codes, scale and products are unchanged, so
+  // the staged tile is bit-for-bit identical.
   std::uint64_t packed;
-  __builtin_memcpy(&packed, block + dim0 % 32, sizeof(packed));
+  __builtin_memcpy(&packed, row + blk * 32 + dim0 % 32, sizeof(packed));
   union {
     uint4 u;
     __half h[8];
@@ -272,7 +279,8 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   const auto* v_cache = reinterpret_cast<const __half*>(a.v_cache);
   // KV-12: q8_0 row strides (all KV heads) for the dequant-tile stage:
   // the K/V rows proper, and the packed rotated-dims row of a global
-  // layer (2 * kGlobalPairs values per head).
+  // layer (2 * kGlobalPairs values per head). Layout v2 totals are
+  // unchanged: blocks * (32 payload + 2 scale) bytes per row.
   const std::size_t row_bytes_q8 =
       static_cast<std::size_t>(a.kv_heads) * (D / 32) * 34;
   const std::size_t rot_row_bytes_q8 =

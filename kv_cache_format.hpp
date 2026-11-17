@@ -19,8 +19,9 @@ namespace gufo::models::gemma4 {
 enum class KvCacheFormat : std::uint32_t {
   /// Binary16 rows, the original layout. Always available.
   kF16,
-  /// ggml-style q8_0 blocks: 32 values as 32 int8 + one fp16 scale
-  /// (34 bytes per 32 values).
+  /// q8_0 blocks: 32 values as 32 int8 codes + one fp16 scale
+  /// (34 bytes per 32 values), stored in the split-plane layout
+  /// versioned by KvQ8Layout below (kKvQ8LayoutCurrent).
   kQ8_0,
   /// Reserved. ParseKvCacheType rejects it until a q4_0 campaign
   /// builds its write/read paths; the value exists so the format
@@ -41,6 +42,35 @@ enum class KvCacheFormat : std::uint32_t {
       return "q4_0";
   }
   return "unknown";
+}
+
+/// Physical layout version of a q8_0 KV cache (Phase 5 REDO R1
+/// audit, R2-global step 1). v1 was the interleaved ggml layout:
+/// each 32-value block stored its fp16 scale inline at bytes
+/// [32, 34) of a 34-byte block. v2 splits every row into a
+/// contiguous int8 payload plane (32 bytes per block, blocks in
+/// row order -- per (head, token, d)) followed by a separate fp16
+/// scale plane indexed [token][head][d_block] within the row.
+/// Total row bytes are identical; only the arrangement changed.
+/// The version is a property of the format: every writer and
+/// reader in this tree implements exactly kKvQ8LayoutCurrent and
+/// caches never outlive the process, so there is no migration --
+/// the flag exists so a future layout change is an explicit
+/// version bump, never a silent reinterpretation of stored bytes.
+enum class KvQ8Layout : std::uint32_t {
+  kInterleavedV1 = 1,
+  kSplitScaleV2 = 2,
+};
+
+inline constexpr KvQ8Layout kKvQ8LayoutCurrent = KvQ8Layout::kSplitScaleV2;
+
+/// Layout version a cache in `format` is stored in: 0 for formats
+/// with no q8_0 layout, else the current q8_0 layout version.
+[[nodiscard]] inline std::uint32_t KvCacheQ8LayoutVersion(
+    KvCacheFormat format) noexcept {
+  return format == KvCacheFormat::kQ8_0
+             ? static_cast<std::uint32_t>(kKvQ8LayoutCurrent)
+             : 0;
 }
 
 /// --kv-cache-type / GUFO_KV_CACHE_TYPE: f16 or q8_0; empty is f16.
@@ -74,7 +104,10 @@ enum class KvCacheFormat : std::uint32_t {
     case KvCacheFormat::kF16:
       return std::size_t{values} * 2;
     case KvCacheFormat::kQ8_0:
-      return (std::size_t{values} + 31) / 32 * 34;
+      // Layout v2: payload plane (32 int8 bytes per block) plus
+      // scale plane (one fp16 per block) -- the same total as the
+      // v1 interleaved 34-byte blocks, differently arranged.
+      return (std::size_t{values} + 31) / 32 * (32 + 2);
     case KvCacheFormat::kQ4_0:
       return (std::size_t{values} + 31) / 32 * 18;
   }
@@ -145,18 +178,46 @@ enum class KvCacheFormat : std::uint32_t {
   return value;
 }
 
-/// q8_0 block geometry: 32 values, 34 bytes (KV-05).
+/// q8_0 block geometry: 32 values per block; a block occupies 32
+/// payload bytes plus a 2-byte fp16 scale (34 bytes total). Since
+/// layout v2 the two parts are stored SPLIT: a row is its payload
+/// plane (all blocks' codes, contiguous, in row order) followed
+/// by its scale plane (all blocks' fp16 scales, in row order).
 inline constexpr std::uint32_t kQ8_0BlockValues = 32;
 inline constexpr std::uint32_t kQ8_0BlockBytes = 34;
+inline constexpr std::uint32_t kQ8_0PayloadBytes = 32;
+inline constexpr std::uint32_t kQ8_0ScaleBytes = 2;
 
-/// Quantizes one 32-value block into `out` (34 bytes): 32 int8 codes
-/// followed by the fp16 scale (little-endian, ggml q8_0 layout).
-/// scale = max|v| / 127; a zero block stores a zero scale and codes.
-/// This is the host reference for the QkvPost device stores (KV-05/KV-06);
-/// the kernel computes the same values (its scale passes through
-/// __float2half, which may differ by at most the fp16 rounding the
-/// host conversion also applies).
-inline void QuantizeQ8_0Block(const float* values, std::uint8_t* out) {
+/// Number of q8_0 blocks in a row of `values` values.
+[[nodiscard]] inline std::size_t Q8_0BlockCount(std::size_t values) noexcept {
+  return (values + kQ8_0BlockValues - 1) / kQ8_0BlockValues;
+}
+
+/// Byte offset of block `block`'s payload within its row (layout
+/// v2 payload plane; the row's value count does not affect it).
+[[nodiscard]] inline std::size_t Q8_0PayloadOffset(std::size_t values,
+                                                   std::size_t block) noexcept {
+  static_cast<void>(values);
+  return block * kQ8_0PayloadBytes;
+}
+
+/// Byte offset of block `block`'s fp16 scale within a row of
+/// `values` values (layout v2 scale plane, after the whole
+/// payload plane of the row).
+[[nodiscard]] inline std::size_t Q8_0ScaleOffset(std::size_t values,
+                                                 std::size_t block) noexcept {
+  return Q8_0BlockCount(values) * kQ8_0PayloadBytes + block * kQ8_0ScaleBytes;
+}
+
+/// Quantizes one 32-value block: the 32 int8 codes go to `codes`
+/// and the fp16 scale bits to `*scale_bits`. scale = max|v| / 127;
+/// a zero block stores a zero scale and codes. This is the host
+/// reference for the QkvPost device stores (KV-05/KV-06); the
+/// kernel computes the same values (its scale passes through
+/// __float2half, which may differ by at most the fp16 rounding
+/// the host conversion also applies).
+inline void QuantizeQ8_0Block(const float* values, std::uint8_t* codes,
+                              std::uint16_t* scale_bits) {
   float amax = 0.0F;
   for (std::uint32_t i = 0; i < kQ8_0BlockValues; ++i) {
     amax = std::max(amax, std::fabs(values[i]));
@@ -164,45 +225,56 @@ inline void QuantizeQ8_0Block(const float* values, std::uint8_t* out) {
   const float scale = amax / 127.0F;
   const float inv = scale != 0.0F ? 1.0F / scale : 0.0F;
   for (std::uint32_t i = 0; i < kQ8_0BlockValues; ++i) {
-    out[i] = static_cast<std::uint8_t>(
+    codes[i] = static_cast<std::uint8_t>(
         static_cast<std::int8_t>(std::round(values[i] * inv)));
   }
-  const std::uint16_t scale_bits = FloatToFp16Bits(scale);
-  out[32] = static_cast<std::uint8_t>(scale_bits & 0xFFU);
-  out[33] = static_cast<std::uint8_t>(scale_bits >> 8);
+  *scale_bits = FloatToFp16Bits(scale);
 }
 
 /// Inverse of QuantizeQ8_0Block.
-inline void DequantizeQ8_0Block(const std::uint8_t* in, float* values) {
-  const auto scale_bits = static_cast<std::uint16_t>(
-      in[32] | (static_cast<std::uint16_t>(in[33]) << 8));
+inline void DequantizeQ8_0Block(const std::uint8_t* codes,
+                                std::uint16_t scale_bits, float* values) {
   const float scale = Fp16BitsToFloat(scale_bits);
   for (std::uint32_t i = 0; i < kQ8_0BlockValues; ++i) {
-    values[i] = static_cast<float>(static_cast<std::int8_t>(in[i])) * scale;
+    values[i] = static_cast<float>(static_cast<std::int8_t>(codes[i])) * scale;
   }
 }
 
 /// Quantizes a whole row of `values` values (a K or V cache row)
 /// into `out`, which must hold KvCacheRowBytes(values, kQ8_0)
-/// bytes. A partial tail block is zero-padded before quantizing.
+/// bytes, in the layout v2 planes: codes at Q8_0PayloadOffset,
+/// scales at Q8_0ScaleOffset. A partial tail block is zero-padded
+/// before quantizing.
 inline void QuantizeQ8_0Row(std::span<const float> row, std::uint8_t* out) {
   float block[kQ8_0BlockValues];
-  for (std::size_t at = 0; at < row.size(); at += kQ8_0BlockValues) {
+  const std::size_t blocks = Q8_0BlockCount(row.size());
+  for (std::size_t b = 0; b < blocks; ++b) {
+    const std::size_t at = b * kQ8_0BlockValues;
     const std::size_t n =
         std::min<std::size_t>(kQ8_0BlockValues, row.size() - at);
     for (std::size_t i = 0; i < kQ8_0BlockValues; ++i) {
       block[i] = i < n ? row[at + i] : 0.0F;
     }
-    QuantizeQ8_0Block(block, out + (at / kQ8_0BlockValues) * kQ8_0BlockBytes);
+    std::uint16_t scale_bits = 0;
+    QuantizeQ8_0Block(block, out + Q8_0PayloadOffset(row.size(), b),
+                      &scale_bits);
+    const std::size_t so = Q8_0ScaleOffset(row.size(), b);
+    out[so] = static_cast<std::uint8_t>(scale_bits & 0xFFU);
+    out[so + 1] = static_cast<std::uint8_t>(scale_bits >> 8);
   }
 }
 
 /// Inverse of QuantizeQ8_0Row for `values` values.
 inline void DequantizeQ8_0Row(const std::uint8_t* in, float* row,
                               std::size_t values) {
-  for (std::size_t at = 0; at < values; at += kQ8_0BlockValues) {
+  const std::size_t blocks = Q8_0BlockCount(values);
+  for (std::size_t b = 0; b < blocks; ++b) {
     float block[kQ8_0BlockValues];
-    DequantizeQ8_0Block(in + (at / kQ8_0BlockValues) * kQ8_0BlockBytes, block);
+    const std::size_t so = Q8_0ScaleOffset(values, b);
+    const auto scale_bits = static_cast<std::uint16_t>(
+        in[so] | (static_cast<std::uint16_t>(in[so + 1]) << 8));
+    DequantizeQ8_0Block(in + Q8_0PayloadOffset(values, b), scale_bits, block);
+    const std::size_t at = b * kQ8_0BlockValues;
     const std::size_t n = std::min<std::size_t>(kQ8_0BlockValues, values - at);
     for (std::size_t i = 0; i < n; ++i) {
       row[at + i] = block[i];

@@ -114,6 +114,35 @@ __device__ inline float RmsScale(float sum_squares, std::uint32_t dim,
   return rsqrtf(sum_squares / static_cast<float>(dim) + eps);
 }
 
+/// KV q8_0 layout v2 (Phase 5 REDO R2-global step 1; the host
+/// mirror is kv_cache_format.hpp KvQ8Layout / Q8_0PayloadOffset /
+/// Q8_0ScaleOffset): a row of `values` values (always a multiple
+/// of 32 on the device paths) stores its int8 payload contiguously
+/// -- 32 bytes per 32-value block, blocks in row order -- then a
+/// separate fp16 scale plane, 2 bytes per block, block index =
+/// head * blocks-per-head + d_block. Total row bytes are unchanged
+/// from layout v1 (blocks * 34).
+__device__ __forceinline__ std::size_t Q8RowBytes(std::size_t values) {
+  return (values / 32) * 34;
+}
+__device__ __forceinline__ std::uint8_t* Q8BlockCodes(std::uint8_t* row,
+                                                      std::size_t block) {
+  return row + block * 32;
+}
+__device__ __forceinline__ const std::uint8_t* Q8BlockCodes(
+    const std::uint8_t* row, std::size_t block) {
+  return row + block * 32;
+}
+__device__ __forceinline__ std::uint8_t* Q8BlockScale(std::uint8_t* row,
+                                                      std::size_t values,
+                                                      std::size_t block) {
+  return row + (values / 32) * 32 + block * 2;
+}
+__device__ __forceinline__ const std::uint8_t* Q8BlockScale(
+    const std::uint8_t* row, std::size_t values, std::size_t block) {
+  return row + (values / 32) * 32 + block * 2;
+}
+
 /// One lane's value of a 32-element block into the tiled Q8_1 prefill
 /// activation, in ggml::LaunchQuantizeActivationQ8_1FromFp32's layout and
 /// rounding (built here with fast-math, a scale may differ by one ulp). The
@@ -546,8 +575,8 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
     // holds dim 32 * (w + kWaves * k) + lane of this head, so WaveMax
     // gives the block amax and each lane writes its own code; lane 0
     // writes the fp16 scale. Matches QuantizeQ8_0Row on the host.
-    const std::size_t row_bytes =
-        (static_cast<std::size_t>(a.kv_heads) * D / 32) * 34;
+    const std::size_t row_values = static_cast<std::size_t>(a.kv_heads) * D;
+    const std::size_t row_bytes = Q8RowBytes(row_values);
     std::uint8_t* row_q8 =
         a.k_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
     constexpr std::uint32_t kBlocksPerHead = D / 32;
@@ -556,14 +585,15 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
 #pragma unroll
       for (int k = 0; k < K; ++k) {
         const std::uint32_t blk = kvh * kBlocksPerHead + w + kWaves * k;
-        std::uint8_t* out = row_q8 + static_cast<std::size_t>(blk) * 34;
+        std::uint8_t* out = Q8BlockCodes(row_q8, blk);
         const float amax = WaveMax(fabsf(v[w][k]));
         const float dscale = amax / 127.0F;
         const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
         out[lane] = static_cast<std::uint8_t>(
             static_cast<std::int8_t>(roundf(v[w][k] * inv)));
         if (lane == 0) {
-          *reinterpret_cast<__half*>(out + 32) = __float2half(dscale);
+          *reinterpret_cast<__half*>(Q8BlockScale(row_q8, row_values, blk)) =
+              __float2half(dscale);
         }
       }
     }
@@ -578,8 +608,9 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
     // amax, each lane writes its own code, lane 0 the fp16 scale.
     // Matches QuantizeQ8_0Row over the packed row on the host.
     const std::uint32_t seg_blocks = pairs / 32;
-    const std::size_t row_bytes =
-        (static_cast<std::size_t>(a.kv_heads) * 2 * seg_blocks) * 34;
+    const std::size_t row_values =
+        static_cast<std::size_t>(a.kv_heads) * 2 * pairs;
+    const std::size_t row_bytes = Q8RowBytes(row_values);
     std::uint8_t* row_q8 =
         a.k_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
 #pragma unroll
@@ -588,14 +619,15 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
       for (int k = 0; k < K; ++k) {
         if (static_cast<std::uint32_t>(w) < seg_blocks) {
           const std::uint32_t blk = kvh * 2 * seg_blocks + k * seg_blocks + w;
-          std::uint8_t* out = row_q8 + static_cast<std::size_t>(blk) * 34;
+          std::uint8_t* out = Q8BlockCodes(row_q8, blk);
           const float amax = WaveMax(fabsf(v[w][k]));
           const float dscale = amax / 127.0F;
           const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
           out[lane] = static_cast<std::uint8_t>(
               static_cast<std::int8_t>(roundf(v[w][k] * inv)));
           if (lane == 0) {
-            *reinterpret_cast<__half*>(out + 32) = __float2half(dscale);
+            *reinterpret_cast<__half*>(Q8BlockScale(row_q8, row_values, blk)) =
+                __float2half(dscale);
           }
         }
       }
@@ -626,8 +658,8 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
     // QuantizeQ8_0Row on the host. KV-09: derived-key layers take
     // this branch too -- their V row is the normalized K projection,
     // stored exactly like a sliding V row.
-    const std::size_t row_bytes =
-        (static_cast<std::size_t>(a.kv_heads) * D / 32) * 34;
+    const std::size_t row_values = static_cast<std::size_t>(a.kv_heads) * D;
+    const std::size_t row_bytes = Q8RowBytes(row_values);
     std::uint8_t* row_q8 =
         a.v_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
     constexpr std::uint32_t kBlocksPerHead = D / 32;
@@ -636,14 +668,15 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
 #pragma unroll
       for (int k = 0; k < K; ++k) {
         const std::uint32_t blk = kvh * kBlocksPerHead + w + kWaves * k;
-        std::uint8_t* out = row_q8 + static_cast<std::size_t>(blk) * 34;
+        std::uint8_t* out = Q8BlockCodes(row_q8, blk);
         const float amax = WaveMax(fabsf(v[w][k]));
         const float dscale = amax / 127.0F;
         const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
         out[lane] = static_cast<std::uint8_t>(
             static_cast<std::int8_t>(roundf(v[w][k] * inv)));
         if (lane == 0) {
-          *reinterpret_cast<__half*>(out + 32) = __float2half(dscale);
+          *reinterpret_cast<__half*>(Q8BlockScale(row_q8, row_values, blk)) =
+              __float2half(dscale);
         }
       }
     }
@@ -793,15 +826,14 @@ __device__ inline void DequantQ8Lane(const std::uint8_t* cache_q8,
                                      std::uint32_t slot, std::uint32_t kv_heads,
                                      std::uint32_t kvh, int lane, float* out) {
   constexpr int P = D / kWave;
-  const std::size_t row_bytes =
-      (static_cast<std::size_t>(kv_heads) * D / 32) * 34;
+  const std::size_t row_values = static_cast<std::size_t>(kv_heads) * D;
   const std::uint32_t dim0 = static_cast<std::uint32_t>(lane) * P;
-  const std::uint8_t* block =
-      cache_q8 + static_cast<std::size_t>(slot) * row_bytes +
-      (static_cast<std::size_t>(kvh) * (D / 32) + dim0 / 32) * 34;
-  const float scale =
-      __half2float(*reinterpret_cast<const __half*>(block + 32));
-  const std::uint8_t* codes = block + dim0 % 32;
+  const std::uint8_t* row =
+      cache_q8 + static_cast<std::size_t>(slot) * Q8RowBytes(row_values);
+  const std::size_t blk = static_cast<std::size_t>(kvh) * (D / 32) + dim0 / 32;
+  const float scale = __half2float(
+      *reinterpret_cast<const __half*>(Q8BlockScale(row, row_values, blk)));
+  const std::uint8_t* codes = Q8BlockCodes(row, blk) + dim0 % 32;
 #pragma unroll
   for (int i = 0; i < P; ++i) {
     out[i] = static_cast<float>(static_cast<std::int8_t>(codes[i])) * scale;
@@ -821,14 +853,14 @@ __device__ inline void DequantQ8PackedLane(const std::uint8_t* cache_q8,
                                            std::uint32_t per_head,
                                            std::uint32_t packed0, float* out) {
   constexpr int P = D / kWave;
-  const std::size_t row_bytes =
-      (static_cast<std::size_t>(kv_heads) * per_head / 32) * 34;
-  const std::uint8_t* block =
-      cache_q8 + static_cast<std::size_t>(slot) * row_bytes +
-      (static_cast<std::size_t>(kvh) * (per_head / 32) + packed0 / 32) * 34;
-  const float scale =
-      __half2float(*reinterpret_cast<const __half*>(block + 32));
-  const std::uint8_t* codes = block + packed0 % 32;
+  const std::size_t row_values = static_cast<std::size_t>(kv_heads) * per_head;
+  const std::uint8_t* row =
+      cache_q8 + static_cast<std::size_t>(slot) * Q8RowBytes(row_values);
+  const std::size_t blk =
+      static_cast<std::size_t>(kvh) * (per_head / 32) + packed0 / 32;
+  const float scale = __half2float(
+      *reinterpret_cast<const __half*>(Q8BlockScale(row, row_values, blk)));
+  const std::uint8_t* codes = Q8BlockCodes(row, blk) + packed0 % 32;
 #pragma unroll
   for (int i = 0; i < P; ++i) {
     out[i] = static_cast<float>(static_cast<std::int8_t>(codes[i])) * scale;
@@ -1088,8 +1120,8 @@ __global__ void __launch_bounds__(kThreads* WPH)
   };
   const auto row_bytes = static_cast<std::uint32_t>(stride * sizeof(__half));
   // KV-07: bytes of one q8_0 cache row (all KV heads) at this head_dim.
-  const auto row_bytes_q8 =
-      static_cast<std::uint32_t>(a.kv_heads * (D / 32) * 34);
+  const auto row_bytes_q8 = static_cast<std::uint32_t>(
+      Q8RowBytes(static_cast<std::size_t>(a.kv_heads) * D));
   const auto* k_head =
       reinterpret_cast<const __half*>(a.k_cache) + blockIdx.y * D;
   const auto* v_head =
@@ -1179,13 +1211,14 @@ __global__ void __launch_bounds__(kThreads* WPH)
         // precision; the single-pass path dequantizes to FP32).
         auto* dst = reinterpret_cast<__half*>(raw);
         if (key >= begin && key < end) {
-          const std::uint8_t* block =
-              q8 + static_cast<std::size_t>(slot_of(key)) * row_bytes_q8 +
-              (static_cast<std::size_t>(blockIdx.y) * (D / 32) + dim0 / 32) *
-                  34;
+          const std::uint8_t* row =
+              q8 + static_cast<std::size_t>(slot_of(key)) * row_bytes_q8;
+          const std::size_t blk =
+              static_cast<std::size_t>(blockIdx.y) * (D / 32) + dim0 / 32;
           const float scale =
-              __half2float(*reinterpret_cast<const __half*>(block + 32));
-          const std::uint8_t* codes = block + dim0 % 32;
+              __half2float(*reinterpret_cast<const __half*>(Q8BlockScale(
+                  row, static_cast<std::size_t>(a.kv_heads) * D, blk)));
+          const std::uint8_t* codes = Q8BlockCodes(row, blk) + dim0 % 32;
 #pragma unroll
           for (int j = 0; j < P; ++j) {
             dst[j] = __float2half(
@@ -1250,13 +1283,14 @@ __global__ void __launch_bounds__(kThreads* WPH)
         for (int seg = 0; seg < 2; ++seg) {
           const std::uint32_t dim0 =
               static_cast<std::uint32_t>(group) * 8 + seg * (D / 2);
-          const std::uint8_t* block =
-              a.v_cache_q8 + static_cast<std::size_t>(slot) * row_bytes_q8 +
-              (static_cast<std::size_t>(blockIdx.y) * (D / 32) + dim0 / 32) *
-                  34;
+          const std::uint8_t* row =
+              a.v_cache_q8 + static_cast<std::size_t>(slot) * row_bytes_q8;
+          const std::size_t blk =
+              static_cast<std::size_t>(blockIdx.y) * (D / 32) + dim0 / 32;
           const float scale =
-              __half2float(*reinterpret_cast<const __half*>(block + 32));
-          const std::uint8_t* codes = block + dim0 % 32;
+              __half2float(*reinterpret_cast<const __half*>(Q8BlockScale(
+                  row, static_cast<std::size_t>(a.kv_heads) * D, blk)));
+          const std::uint8_t* codes = Q8BlockCodes(row, blk) + dim0 % 32;
           __half* dst = seg == 0 ? lo : hi;
 #pragma unroll
           for (int j = 0; j < 8; ++j) {
@@ -1314,16 +1348,17 @@ __global__ void __launch_bounds__(kThreads* WPH)
         const std::uint32_t packed0 =
             static_cast<std::uint32_t>(u % rot_chunks) * 8;
         const std::uint32_t per_head = 2 * static_cast<std::uint32_t>(pairs);
-        const std::uint8_t* block =
+        const std::size_t row_values =
+            static_cast<std::size_t>(a.kv_heads) * per_head;
+        const std::uint8_t* row =
             a.k_cache_q8 +
-            static_cast<std::size_t>(slot_of(key)) *
-                (a.kv_heads * (per_head / 32) * 34) +
-            (static_cast<std::size_t>(blockIdx.y) * (per_head / 32) +
-             packed0 / 32) *
-                34;
-        const float scale =
-            __half2float(*reinterpret_cast<const __half*>(block + 32));
-        const std::uint8_t* codes = block + packed0 % 32;
+            static_cast<std::size_t>(slot_of(key)) * Q8RowBytes(row_values);
+        const std::size_t blk =
+            static_cast<std::size_t>(blockIdx.y) * (per_head / 32) +
+            packed0 / 32;
+        const float scale = __half2float(*reinterpret_cast<const __half*>(
+            Q8BlockScale(row, row_values, blk)));
+        const std::uint8_t* codes = Q8BlockCodes(row, blk) + packed0 % 32;
         auto* dst = reinterpret_cast<__half*>(&staged_rot[n]);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {

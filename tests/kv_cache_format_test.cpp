@@ -68,6 +68,18 @@ void CheckRowBytes() {
           "empty row is not free");
   Require(g4::KvCacheRowBytes(2048, KvCacheFormat::kQ4_0) == 1152,
           "reserved q4_0 layout bytes wrong (64 blocks x 18)");
+  // Layout v2 (Phase 5 REDO R2-global step 1): q8_0 rows are
+  // versioned split-plane -- payload first, scales after -- at
+  // unchanged totals.
+  Require(g4::KvCacheQ8LayoutVersion(KvCacheFormat::kQ8_0) == 2,
+          "q8_0 layout version is not v2 (split scale plane)");
+  Require(g4::KvCacheQ8LayoutVersion(KvCacheFormat::kF16) == 0,
+          "f16 must not carry a q8_0 layout version");
+  Require(g4::Q8_0PayloadOffset(2048, 3) == 96, "q8_0 payload offset wrong");
+  Require(g4::Q8_0ScaleOffset(2048, 0) == 2048,
+          "q8_0 scale plane does not start after the payload");
+  Require(g4::Q8_0ScaleOffset(2048, 63) == 2048 + 126,
+          "q8_0 scale offset wrong");
 }
 
 void CheckStorageBytes() {
@@ -126,27 +138,27 @@ void CheckQ8BlockLayout() {
   for (float& v : ones) {
     v = 1.0F;
   }
-  std::uint8_t bytes[34];
-  g4::QuantizeQ8_0Block(ones, bytes);
+  std::uint8_t codes[32];
+  std::uint16_t scale_bits = 0;
+  g4::QuantizeQ8_0Block(ones, codes, &scale_bits);
   for (int i = 0; i < 32; ++i) {
-    Require(bytes[i] == 127, "constant block code is not 127");
+    Require(codes[i] == 127, "constant block code is not 127");
   }
-  const auto scale_bits = static_cast<std::uint16_t>(
-      bytes[32] | (static_cast<std::uint16_t>(bytes[33]) << 8));
   Require(scale_bits == g4::FloatToFp16Bits(1.0F / 127.0F),
-          "block scale is not fp16(1/127) at bytes 32..33");
+          "block scale is not fp16(1/127)");
   float back[32];
-  g4::DequantizeQ8_0Block(bytes, back);
+  g4::DequantizeQ8_0Block(codes, scale_bits, back);
   for (const float v : back) {
     Require(std::fabs(v - 1.0F) < 0.01F, "constant block roundtrip off");
   }
   // A zero block roundtrips to exact zeros with a zero scale.
   float zeros[32] = {};
-  g4::QuantizeQ8_0Block(zeros, bytes);
-  g4::DequantizeQ8_0Block(bytes, back);
-  for (int i = 0; i < 34; ++i) {
-    Require(bytes[i] == 0, "zero block stores nonzero bytes");
+  g4::QuantizeQ8_0Block(zeros, codes, &scale_bits);
+  g4::DequantizeQ8_0Block(codes, scale_bits, back);
+  for (int i = 0; i < 32; ++i) {
+    Require(codes[i] == 0, "zero block stores nonzero codes");
   }
+  Require(scale_bits == 0, "zero block stores a nonzero scale");
   for (const float v : back) {
     Require(v == 0.0F, "zero block roundtrip is not exact");
   }
@@ -254,8 +266,9 @@ void CheckQ8VRowRoundtrip() {
 // from KvCacheRowBytes -- across two full ring wraps. Every slot
 // must roundtrip its LAST writer, and a constant row written at a
 // wrapped position must land at the exact byte offsets of its slot
-// (codes at slot*row_bytes + block*34, scale at +32) with the
-// neighbouring slots untouched.
+// (layout v2: codes at slot*row_bytes + block*32 in the payload
+// plane, scales in the scale plane at slot*row_bytes + 2048 +
+// block*2) with the neighbouring slots untouched.
 void CheckQ8RingLayout() {
   constexpr std::uint32_t kRing = 8;
   constexpr std::size_t kValues = 2048;
@@ -296,8 +309,9 @@ void CheckQ8RingLayout() {
   // the roundtrip error stays under half a step plus fp16 rounding.
   Require(max_abs <= 0.012, "ring-wrapped q8_0 rows roundtrip badly");
   // Byte-offset pin on a fresh region: a constant 0.5 row stored at
-  // position kRing + 2 lands in slot 2; every block holds codes 127
-  // and the fp16 scale of 0.5/127 at block offset +32.
+  // position kRing + 2 lands in slot 2; in layout v2 every block's
+  // codes 127 sit in the payload plane (block * 32) and the fp16
+  // scale of 0.5/127 sits in the scale plane (2048 + block * 2).
   std::vector<std::uint8_t> pin(kRing * row_bytes, 0);
   std::vector<float> flat(kValues, 0.5F);
   const std::uint32_t wrapped_pos = kRing + 2;
@@ -305,13 +319,14 @@ void CheckQ8RingLayout() {
   const std::size_t base = 2 * row_bytes;
   const auto want_scale = g4::FloatToFp16Bits(0.5F / 127.0F);
   for (std::size_t blk = 0; blk < kValues / 32; ++blk) {
-    const std::size_t at = base + blk * 34;
+    const std::size_t at = base + blk * 32;
     for (int i = 0; i < 32; ++i) {
       Require(pin[at + i] == 127, "ring pin: code not at its byte offset");
     }
+    const std::size_t sat = base + kValues + blk * 2;
     const auto scale_bits = static_cast<std::uint16_t>(
-        pin[at + 32] | (static_cast<std::uint16_t>(pin[at + 33]) << 8));
-    Require(scale_bits == want_scale, "ring pin: scale not at +32");
+        pin[sat] | (static_cast<std::uint16_t>(pin[sat + 1]) << 8));
+    Require(scale_bits == want_scale, "ring pin: scale not in scale plane");
   }
   for (std::size_t i = 0; i < pin.size(); ++i) {
     if (i < base || i >= base + row_bytes) {

@@ -48,8 +48,11 @@ struct QkvPostArgs {
   std::uint16_t* v_cache;  ///< binary16
   /// When non-null (KV-05), K rows are stored q8_0 instead of binary16:
   /// the row for slot s starts at k_cache_q8 + s * KvCacheRowBytes(
-  /// kv_heads * head_dim, kQ8_0) and holds one 34-byte block per 32
-  /// values in row order (per-head blocks contiguous). With
+  /// kv_heads * head_dim, kQ8_0) in layout v2 (see
+  /// kv_cache_format.hpp KvQ8Layout): the row's int8 payload is
+  /// contiguous per 32-value block in row order, and the fp16
+  /// block scales live in a separate plane after the payload.
+  /// With
   /// rotated_pairs > 0 (KV-09, derived-key layers) the stored row is
   /// instead the packed rotated dims: KvCacheRowBytes(kv_heads * 2 *
   /// rotated_pairs, kQ8_0) bytes per slot, per head the dims
@@ -140,8 +143,10 @@ struct AttentionArgs {
   /// When non-null (KV-07), K rows are read from these q8_0 blocks
   /// with in-kernel dequantization instead of the binary16 cache: the
   /// row for slot s starts at k_cache_q8 + s * KvCacheRowBytes(
-  /// kv_heads * head_dim, kQ8_0), one 34-byte block per 32 values in
-  /// row order -- the layout QkvPost (KV-05) writes. With rope_pairs
+  /// kv_heads * head_dim, kQ8_0) in layout v2 -- contiguous int8
+  /// payload per 32-value block in row order, fp16 scales in the
+  /// separate plane after it -- the layout QkvPost (KV-05) writes.
+  /// With rope_pairs
   /// > 0 (KV-09, derived-key layers) this is instead the packed
   /// rotated-dims store QkvPost writes for those layers
   /// (KvCacheRowBytes(kv_heads * 2 * rope_pairs, kQ8_0) per slot);
