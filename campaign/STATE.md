@@ -66,6 +66,23 @@ in this extension and what the work is:
 - Setting: `GUFO_KV_CACHE_TYPE` (f16 | q8_0 | q4_0), the Ollama way.
 - Status: house founded; the campaign itself starts at Volmarr's word.
 
+## Roadmap and minder (2026-11-17)
+
+- Volmarr commissioned the build the same day the house was
+  founded: full roadmap at `campaign/KV_Q8_ROADMAP.md` (Phases
+  0-8, slices KV-01..KV-16, gates per phase).
+- Progress ledger: `campaign/KV_PROGRESS.md` on this branch —
+  the minder and every builder keep it current in the same
+  commits that bank slices.
+- A 10-minute keeper minder (job `gufo-kv-q8-keeper`) guards the
+  campaign under Volmarr's keeper law: it checks the work is
+  flowing, restarts stopped slices, and banks in roadmap order.
+  It reports to Volmarr only at phase gates, at completion, or
+  on a genuine blocker.
+- Build lock: a builder holds `campaign/.kv-build.lock` (device
+  side, uncommitted) while working; the minder observes only
+  while a fresh lock and a live build/bench process exist.
+
 ## Relation to the core line
 
 The resident service (`gufo-resident.service` on purpleraider, core
