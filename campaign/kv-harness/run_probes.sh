@@ -27,7 +27,11 @@ while IFS= read -r line; do
     -n 96 --no-display-prompt > "$OUT/$id.txt" 2>"$OUT/$id.err"
 done < "$HERE/probes.txt"
 
-# Long-context needle probe (~16k tokens of filler, fact in the middle).
+# Long-context needle probe (fact in the middle). Filler repeat is
+# ~28 tokens; 280 repeats per side measures ~15.7k prompt tokens
+# (verified from the response usage in LONG-1.raw.json). An earlier
+# 650-per-side version measured 36,459 tokens and overflowed the
+# 32768 context with a clean 400 -- the count here is deliberate.
 LONGTXT="$(mktemp)"
 python3 - "$LONGTXT" <<'PYEOF'
 import sys
@@ -36,7 +40,7 @@ filler = ("The road wound through pine hills and the river ran cold "
           "as he always had. ")
 needle = ("In his ledger the keeper wrote one line that mattered: "
           "the vault combination is 47-12-89. ")
-parts = [filler * 650, needle, filler * 650,
+parts = [filler * 280, needle, filler * 280,
          "\nQuestion: What is the vault combination given in the "
          "text above? Answer with the numbers only."]
 open(sys.argv[1], "w").write("".join(parts))
@@ -55,12 +59,16 @@ for _ in $(seq 1 60); do
   fi
   sleep 2
 done
+rm -f "$OUT/LONG-1.err"
 if [ "$ready" -ne 1 ]; then
   echo "serve did not come up on :$PORT (see LONG-1.server.log)" \
     > "$OUT/LONG-1.err"
-else
-  python3 - "$LONGTXT" "$PORT" > "$OUT/LONG-1.raw.json" <<'PYEOF'
-import json, sys, urllib.request
+  echo "LONG-1 FAILED: serve never came up" >&2
+  exit 1
+fi
+if ! python3 - "$LONGTXT" "$PORT" "$OUT/LONG-1.err" \
+    > "$OUT/LONG-1.raw.json" <<'PYEOF'
+import json, sys, urllib.error, urllib.request
 text = open(sys.argv[1]).read()
 body = json.dumps({
     "model": "kv-probe",
@@ -70,13 +78,20 @@ body = json.dumps({
 req = urllib.request.Request(
     "http://127.0.0.1:%s/v1/chat/completions" % sys.argv[2],
     data=body, headers={"Content-Type": "application/json"})
-sys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())
+try:
+    sys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())
+except urllib.error.HTTPError as e:
+    open(sys.argv[3], "w").write("HTTP %s: %s" % (e.code, e.read().decode()))
+    sys.exit(1)
 PYEOF
-  python3 - "$OUT/LONG-1.raw.json" > "$OUT/LONG-1.txt" <<'PYEOF'
+then
+  echo "LONG-1 FAILED: $(cat "$OUT/LONG-1.err")" >&2
+  exit 1
+fi
+python3 - "$OUT/LONG-1.raw.json" > "$OUT/LONG-1.txt" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 print(d["choices"][0]["message"]["content"])
 PYEOF
-fi
 rm -f "$LONGTXT"
 echo "probes done: $OUT"
