@@ -1175,3 +1175,90 @@ starts; E2 int8-WMMA QK spike, microbenchmark only), or
 the executor-level R3 redesign, which needs Volmarr word
 as a future round. Phase 6 (KV-13) does NOT start.
 No quantized mode becomes any default.
+
+## Phase 5 REDO R7 round 2 -- R4 rotated-K audit (2026-11-17, keeper tick 15:54 EST)
+
+Conclusion first: the one part of R4 not yet fused -- the
+rotated-K store of the global layers -- CAN take a fused
+dequant-on-load loader, in the half-block form already proven
+for sliding in R2-sliding. Nothing was implemented this tick;
+this entry is the audit evidence and the implementation spec
+for the next tick. No build, bench, speed or probe claim is
+made here.
+
+Evidence (all on HEAD 042e0da, hip/attention_wmma.hip.cpp):
+
+1. What R4 already holds. In the global full-tile q8 fetch the
+   V store (512 values per head) is fused (R2-global step 2,
+   LoadQ8BlockRaw + in-wave distribution), and the V block
+   values serve both the K-from-V dims and the V tile from the
+   same registers -- nothing is read or dequantized twice on
+   that road. The rotated-K chunks are the named exception,
+   kept on the per-chunk road because their chunk lanes span
+   waves (fetch comment, ~lines 435-439; call at ~line 486:
+   k_rot = DequantQ8Chunk(a.k_cache_q8, rot_row_bytes_q8,
+   key0 + tid % kKeys, kv_head, 2 * kGlobalPairs,
+   (tid / kKeys) * 8)).
+
+2. Rotated-K geometry. kGlobalPairs = 64 (line 194), so the
+   rotated row is 128 values per head = 4 q8 blocks of 32.
+   kRotChunks = kKeys * 2 * kGlobalPairs / 8 = 16 * 128 / 8
+   = 256 chunks per tile; rot_wave = wave < 8. Chunk r = tid
+   (tid < 256) is key tid % 16, dim group c = tid / 16 in
+   0..15, dims 8c..8c+7 of the rotated row. The store side
+   (store_keys, ~lines 637-646) writes k_rot to LDS dims
+   c * 8 for c < 8 and D/2 + (c - 8) * 8 for c >= 8.
+
+3. The half-block opening (same shape as R2-sliding). For one
+   key and one 32-value block b, the four chunks sit at tids
+   key + 16*(4b), +16*(4b+1), +16*(4b+2), +16*(4b+3) -- two
+   waves. Inside ONE wave, lanes l and l+16 hold chunks 2c
+   and 2c+1 of the same block for the SAME key (a wave covers
+   two consecutive dim groups for all 16 keys). So lane l can
+   load the half block (16 codes as one uint4 from the
+   payload plane, the block fp16 scale once from the scale
+   plane, via the existing LoadQ8HalfBlockRaw with
+   per_head = 2 * kGlobalPairs) and the raw words + scale
+   bits reach lane l+16 by __shfl, executed unconditionally
+   for the whole wave; each lane then dequantizes exactly its
+   own chunk with DequantQ8Packed -- bit-identical arithmetic,
+   same as every fused loader banked so far.
+
+4. Expected saving, bounded honestly. Today each rotated
+   block per key costs four 8-byte code gathers + four scale
+   re-reads (one per chunk). Fused: two 16-byte code loads +
+   two scale loads per block per key (one pair per wave).
+   But the rotated row is only 128 of the 640 values fetched
+   per head per key (V 512 + rotated 128), so even a perfect
+   fusion touches at most about a fifth of the global fetch
+   traffic, and the fetch is only part of tile cost. This
+   slice alone is therefore NOT expected to close the full
+   pp16384 gap (-3.24 pct at the R5 gate); the LDS bf16
+   round-trip remains the other named suspect. The slice is
+   still worth banking: it removes the last per-chunk road
+   in the global path, with a proven pattern and a bit-
+   identity proof obligation, and it prices the rotated-K
+   share exactly for the round after it.
+
+5. Scope and risks for the implementation tick.
+   - Full tiles only: the fused call sits in the same
+     key0 + kKeys <= block_hi branch as the V fusion; the
+     partial-tile road (~line 602 ff.) keeps the exact
+     per-chunk DequantQ8Chunk call and its bounds logic.
+   - rot_wave lanes only produce k_rot, but __shfl must run
+     unconditionally across each participating wave, as in
+     R2-sliding; waves >= 8 do not participate.
+   - Half-block alignment: dim groups pair as (0,1), (2,3),
+     ... so d8 % 32 is 0 or 16 for the loading lane, which
+     is exactly LoadQ8HalfBlockRaw precondition.
+   - Proof obligations, same as R2: nix build clean, host
+     kv_cache_format PASS with identical roundtrip numbers,
+     all five probes byte-identical q8 vs same-binary f16,
+     prefill medians at pp512 / pp4096 / pp16384 recorded
+     whether or not they improve. No gate pass is claimed
+     unless the R5 raised bar is met in a separate gate run.
+
+Next: implement the R4 rotated-K half-block fusion per this
+spec, bank it with its evidence, then re-run the R5 gate
+protocol. If the gate still fails, the next R7 round takes
+on the LDS bf16 round-trip itself.
