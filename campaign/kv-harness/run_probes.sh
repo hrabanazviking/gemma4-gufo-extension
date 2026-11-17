@@ -3,11 +3,19 @@
 # (short probes, "ID :: PROMPT" per line) + one long-context needle
 # probe built here. Greedy decoding: temperature 0, seed 42,
 # thinking off. Full answers land in results/<label>/probes/.
+#
+# Roads: short probes use `gufo prompt` (its session context is
+# fixed at 4096 and it has no --context option). The long probe
+# (~16k tokens) therefore runs through a throwaway `gufo serve llm`
+# on a spare port with --context 32768, OpenAI chat completions,
+# killed afterward. Same road every phase, so answers compare
+# like-for-like.
 # Usage: run_probes.sh <label> [gufo-bin]
 set -u
 LABEL="${1:?usage: run_probes.sh <label> [gufo-bin]}"
 GUFO="${2:-$HOME/.nix-profile/bin/gufo}"
 MODEL="${KV_MODEL:-$HOME/models/gufo/gemma-4-26B-A4B-it-heretic.Q8_0.gguf}"
+PORT="${KV_PROBE_PORT:-18200}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/results/$LABEL/probes"
 mkdir -p "$OUT"
@@ -16,7 +24,7 @@ while IFS= read -r line; do
   case "$line" in ''|\#*) continue;; esac
   id="${line%% :: *}"; prompt="${line##* :: }"
   "$GUFO" prompt -m "$MODEL" -p "$prompt" -t 0 -s 42 --think off \
-    --context 32768 -n 96 --no-display-prompt > "$OUT/$id.txt" 2>"$OUT/$id.err"
+    -n 96 --no-display-prompt > "$OUT/$id.txt" 2>"$OUT/$id.err"
 done < "$HERE/probes.txt"
 
 # Long-context needle probe (~16k tokens of filler, fact in the middle).
@@ -33,7 +41,42 @@ parts = [filler * 650, needle, filler * 650,
          "text above? Answer with the numbers only."]
 open(sys.argv[1], "w").write("".join(parts))
 PYEOF
-"$GUFO" prompt -m "$MODEL" -f "$LONGTXT" -t 0 -s 42 --think off \
-  --context 32768 -n 32 --no-display-prompt > "$OUT/LONG-1.txt" 2>"$OUT/LONG-1.err"
+
+"$GUFO" serve llm --host 127.0.0.1 --port "$PORT" --model "$MODEL" \
+  --served-model-name kv-probe --context 32768 \
+  > "$OUT/LONG-1.server.log" 2>&1 &
+SERVER_PID=$!
+cleanup() { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }
+trap cleanup EXIT
+ready=0
+for _ in $(seq 1 60); do
+  if curl -s "http://127.0.0.1:$PORT/v1/models" > /dev/null 2>&1; then
+    ready=1; break
+  fi
+  sleep 2
+done
+if [ "$ready" -ne 1 ]; then
+  echo "serve did not come up on :$PORT (see LONG-1.server.log)" \
+    > "$OUT/LONG-1.err"
+else
+  python3 - "$LONGTXT" "$PORT" > "$OUT/LONG-1.raw.json" <<'PYEOF'
+import json, sys, urllib.request
+text = open(sys.argv[1]).read()
+body = json.dumps({
+    "model": "kv-probe",
+    "messages": [{"role": "user", "content": text}],
+    "temperature": 0, "seed": 42, "max_tokens": 32,
+}).encode()
+req = urllib.request.Request(
+    "http://127.0.0.1:%s/v1/chat/completions" % sys.argv[2],
+    data=body, headers={"Content-Type": "application/json"})
+sys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())
+PYEOF
+  python3 - "$OUT/LONG-1.raw.json" > "$OUT/LONG-1.txt" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["choices"][0]["message"]["content"])
+PYEOF
+fi
 rm -f "$LONGTXT"
 echo "probes done: $OUT"
