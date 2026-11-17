@@ -76,7 +76,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-03 format field + allocation | DONE | ff8cf4f; section below |
 | KV-04 GUFO_KV_CACHE_TYPE plumbing | DONE | f427c09 + format fix 5f59d2e; section below |
 | KV-05 quantize-on-write K (sliding) | DONE | section below; roundtrip max_abs_err 0.010000, SNR 48.25 dB |
-| KV-06 quantize-on-write V + ring | PENDING | |
+| KV-06 quantize-on-write V + ring | DONE | section below; V roundtrip max_abs_err 0.010000, SNR 48.15 dB; ring max_abs_err 0.006234 |
 | KV-07 dequant-in-decode (sliding) | PENDING | |
 | KV-08 decode correctness + speed gate | PENDING | |
 | KV-09 global layers derived-K | PENDING | |
@@ -189,11 +189,73 @@ proof for both stores; the Phase 2 gate closes there (no write
 path still writing raw bf16 in q8_0 mode). KV-07 then builds the
 decode read path, which is what may lift the CreateCache refusal.
 
+## Phase 2 second slice (KV-06) -- q8_0 V quantize-on-write + ring
+
+What landed:
+- `hip/kernels.hpp` + `hip/kernels.hip.cpp`: `QkvPostArgs` gains
+  `v_cache_q8`, mirroring `k_cache_q8`. When set (and
+  rotated_pairs == 0), QkvPost stores the V row for a slot as q8_0
+  blocks at slot * KvCacheRowBytes(kv_heads * head_dim, kQ8_0) --
+  the same ggml block layout, the same one-block-per-wave WaveMax
+  store, and the same existing slot/ring computation as the KV-05
+  K store, so linear and ring slots are addressed identically.
+  The f16 V store is the old code, moved under an else.
+- `hip/executor.cpp`: Forward passes `v_cache_q8` for sliding
+  layers when `cache.format == kQ8_0`, beside `k_cache_q8`.
+  CreateCache still deliberately refuses q8_0 end-to-end -- only
+  the decode read path (KV-07) is missing now, and the refusal
+  message says exactly that.
+- Write-path audit (the Phase 2 gate's second half): QkvPost is
+  the only kernel that stores projected K/V rows. The attention
+  kernels only read the caches; MoveKey and CopyRuns relocate
+  already-stored rows byte-wise and never write bf16 from a
+  projection (their re-proof over the quantized layout is KV-13).
+  Global layers still store V as bf16: their V is the normalized
+  K projection (rotated_pairs > 0), the derived-K design is
+  Phase 4 (KV-09), and the executor passes `v_cache_q8` only for
+  sliding layers. So in q8_0 mode no sliding-layer write path
+  still writes raw bf16.
+- Tests: `tests/kv_cache_format_test.cpp` extended (same
+  registered `gemma4.kv_cache_format` test) with the V-row
+  roundtrip and the ring-layout proof below.
+
+Verification (2026-11-17, device):
+- Standalone compile of the registered test (g++ -std=c++20
+  -Wall -Wextra, headers only) -> PASS. V row (2048 values,
+  deterministic pseudo-random in [-2, 2], one outlier block with
+  amax 6): **max abs error 0.010000**, **max abs error outside
+  the outlier block 0.008249**, **SNR 48.15 dB** -- inside the
+  same asserted bounds as K (max <= 0.04, calm <= 0.012,
+  SNR >= 30 dB). Ring proof: 20 positions stored at
+  slot = position % 8 over two full wraps roundtrip their last
+  writers with **max abs error 0.006234**, and a constant row at
+  a wrapped position lands at the exact byte offsets of its slot
+  (codes at slot*2176 + block*34, fp16 scale at +32, neighbouring
+  slots untouched).
+- nix build of the KV-06 tree: clean (detached, ~4 min wall;
+  store path 7sb5c12c...-gufo-0-unstable-4938016). clang-format
+  clean on all touched files.
+- f16 spot check on the KV-06 binary: FACT-1 probe answers
+  `Paris`, identical to the KV-02 baseline. `--kv-cache-type
+  q8_0` prints the format report line, then the session refusal
+  naming KV-07 only -- no silent q8_0 mode.
+- Installed profile and gufo-resident.service untouched;
+  Ollama (:11434) untouched.
+
+**Phase 2 gate: PASSED** 2026-11-17 -- roundtrip bounds recorded
+for both halves (K: max 0.010000, calm 0.008366, SNR 48.25 dB;
+V: max 0.010000, calm 0.008249, SNR 48.15 dB; ring rows max
+0.006234), and no sliding-layer write path still writes raw
+bf16 in q8_0 mode. Next (KV-07): the decode read path
+(dequant-in-decode for sliding layers), which is what may lift
+the CreateCache refusal.
+
 ## Phase gates
 
 - Phase 0 gate: PASSED 2026-11-17 — harness committed (KV-01),
   baseline table + probe answers banked (KV-02).
 - Phase 1 gate: PASSED 2026-11-17 — evidence below.
+- Phase 2 gate: PASSED 2026-11-17 — evidence in the KV-06 section above.
 
 ## Phase 1 (KV-03 + KV-04) — format field, allocation, plumbing
 
