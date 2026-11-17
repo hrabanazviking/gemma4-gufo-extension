@@ -214,8 +214,8 @@ std::size_t Executor::CacheBytes(const Config& c, std::uint32_t max_context,
     const std::uint32_t slots =
         c.IsSliding(l) ? std::min(ring, max_context) : max_context;
     layers.push_back(KvLayerShape{slots, key_widths[l], c.KvDim(l)});
-    // KV-07: a quantized cache is mixed -- sliding layers quantized,
-    // global layers binary16 until the derived-K design (KV-09).
+    // KV-09: every layer takes the cache format (KvCacheLayerFormat);
+    // global layers store their V row and packed rotated-K dims.
     formats.push_back(KvCacheLayerFormat(format, c.IsSliding(l)));
   }
   return KvCacheStorageBytesPerLayer(layers, formats) +
@@ -260,6 +260,21 @@ Executor::Executor(const DeviceModel& model, std::uint32_t max_rows,
       Plan(model.config(), model.has_draft() ? &model.draft().config : nullptr,
            model.vocab_size(), model.max_cols(), model.max_half_cols(),
            max_rows, max_logit_rows, max_context);
+  if (kv_format_ == KvCacheFormat::kQ8_0) {
+    // KV-09: the quantized derived-key layout implements the
+    // production global geometry (64 rotated pairs -- the value the
+    // WMMA prefill path and the split kernel's staged tiles already
+    // hardcode). Refuse any other derived geometry by name rather
+    // than store a layout no read path reconstructs.
+    for (std::uint32_t l = 0; l < model.config().num_layers; ++l) {
+      if (DerivedKeys(l) && model_.global_rope_pairs() != 64) {
+        throw std::invalid_argument(
+            "gemma4 q8_0 KV cache: derived-key layers need 64 rotated "
+            "pairs (KV-09), this model has " +
+            std::to_string(model_.global_rope_pairs()));
+      }
+    }
+  }
   if (const Config& c = model.config();
       c.HasExperts() &&
       (c.hidden_size % 128 != 0 || c.hidden_size > kMaxRouterHidden ||
@@ -975,12 +990,14 @@ void Executor::Forward(std::span<const Segment> segments,
       post.freq_factors = sliding ? nullptr : model_.rope_factors();
       post.k_cache = cache.k[l];
       post.v_cache = cache.v[l];
-      // KV-05/KV-06: sliding layers store K and V as q8_0 when the
-      // cache format says so; KV-07 reads them back in decode.
-      post.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+      // KV-05/KV-06: layers store K and V as q8_0 when the cache
+      // format says so; KV-07 reads sliding layers back in decode.
+      // KV-09: global layers too -- QkvPost stores their V row and
+      // their packed rotated-K dims as q8_0 (rotated_pairs > 0).
+      post.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0
                             ? reinterpret_cast<std::uint8_t*>(cache.k[l])
                             : nullptr;
-      post.v_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+      post.v_cache_q8 = cache.format == KvCacheFormat::kQ8_0
                             ? reinterpret_cast<std::uint8_t*>(cache.v[l])
                             : nullptr;
       post.rows = seg.rows;
@@ -999,16 +1016,16 @@ void Executor::Forward(std::span<const Segment> segments,
       att.q = q_ + std::size_t{row0} * c.QDim(l);
       att.k_cache = cache.k[l];
       att.v_cache = cache.v[l];
-      // KV-07: a q8_0 sliding layer at prefill widths takes the
+      // KV-07: a q8_0 layer at prefill widths takes the
       // single-pass kernel (LaunchAttention), which needs its FP32
       // output; the binary16 copy the prefill projection consumes
       // is narrowed from it there. Other layers keep the WMMA
       // route's null FP32 output when the output projection is
       // binary16-only.
-      att.out = half_only({&L.attn_output}) &&
-                        !(cache.format == KvCacheFormat::kQ8_0 && sliding)
-                    ? nullptr
-                    : attn_ + std::size_t{row0} * c.QDim(l);
+      att.out =
+          half_only({&L.attn_output}) && cache.format != KvCacheFormat::kQ8_0
+              ? nullptr
+              : attn_ + std::size_t{row0} * c.QDim(l);
       att.partials = partials_;
       att.rows = seg.rows;
       att.heads = c.num_heads;
@@ -1023,13 +1040,15 @@ void Executor::Forward(std::span<const Segment> segments,
       att.out_half =
           half ? static_cast<__half*>(x_half_) + std::size_t{row0} * c.QDim(l)
                : nullptr;
-      // KV-07: sliding layers of a q8_0 cache are read from their
-      // q8_0 blocks with in-kernel dequantization; global layers
-      // (and every f16 cache) keep the binary16 pointers above.
-      att.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+      // KV-07: layers of a q8_0 cache are read from their q8_0
+      // blocks with in-kernel dequantization; f16 caches keep the
+      // binary16 pointers above. KV-09: global layers included --
+      // their k_cache_q8 is the packed rotated-dims store and their
+      // v_cache_q8 the V store the keys are reconstructed from.
+      att.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0
                            ? reinterpret_cast<std::uint8_t*>(cache.k[l])
                            : nullptr;
-      att.v_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+      att.v_cache_q8 = cache.format == KvCacheFormat::kQ8_0
                            ? reinterpret_cast<std::uint8_t*>(cache.v[l])
                            : nullptr;
       att.siblings = post.siblings;
@@ -1657,16 +1676,14 @@ void Executor::DraftChains(std::span<DraftJob> jobs) {
         att.key_limit = position;  // committed keys only
         att.window = sliding ? c.sliding_window : 0;
         att.ring = sliding ? cache.ring : 0;
-        // KV-07: the shared source layer is read as q8_0 when it is a
-        // sliding layer of a q8_0 cache, as in Forward.
-        att.k_cache_q8 =
-            cache.format == KvCacheFormat::kQ8_0 && tc.IsSliding(source)
-                ? reinterpret_cast<std::uint8_t*>(cache.k[source])
-                : nullptr;
-        att.v_cache_q8 =
-            cache.format == KvCacheFormat::kQ8_0 && tc.IsSliding(source)
-                ? reinterpret_cast<std::uint8_t*>(cache.v[source])
-                : nullptr;
+        // KV-07: the shared source layer is read as q8_0 in a q8_0
+        // cache, as in Forward (KV-09: global sources included).
+        att.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0
+                             ? reinterpret_cast<std::uint8_t*>(cache.k[source])
+                             : nullptr;
+        att.v_cache_q8 = cache.format == KvCacheFormat::kQ8_0
+                             ? reinterpret_cast<std::uint8_t*>(cache.v[source])
+                             : nullptr;
         DeriveKeys(att, source);
         Attention(att, stream_);
       }

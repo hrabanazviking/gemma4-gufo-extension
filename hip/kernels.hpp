@@ -49,12 +49,18 @@ struct QkvPostArgs {
   /// When non-null (KV-05), K rows are stored q8_0 instead of binary16:
   /// the row for slot s starts at k_cache_q8 + s * KvCacheRowBytes(
   /// kv_heads * head_dim, kQ8_0) and holds one 34-byte block per 32
-  /// values in row order (per-head blocks contiguous). Only valid with
-  /// rotated_pairs == 0.
+  /// values in row order (per-head blocks contiguous). With
+  /// rotated_pairs > 0 (KV-09, derived-key layers) the stored row is
+  /// instead the packed rotated dims: KvCacheRowBytes(kv_heads * 2 *
+  /// rotated_pairs, kQ8_0) bytes per slot, per head the dims
+  /// [0, rotated_pairs) then [head_dim / 2, + rotated_pairs) in row
+  /// order, quantized after the rotation.
   std::uint8_t* k_cache_q8{nullptr};
-  /// Same for V rows (KV-06): when non-null (and rotated_pairs == 0),
-  /// V rows are stored q8_0 at v_cache_q8 + s * KvCacheRowBytes(
-  /// kv_heads * head_dim, kQ8_0), the same block layout as K.
+  /// Same for V rows (KV-06): when non-null, V rows are stored q8_0
+  /// at v_cache_q8 + s * KvCacheRowBytes(kv_heads * head_dim, kQ8_0),
+  /// the same block layout as K. Also set for derived-key layers
+  /// (KV-09): their V row is the normalized K projection the keys
+  /// are reconstructed from.
   std::uint8_t* v_cache_q8{nullptr};
   std::uint32_t rows;
   std::uint32_t heads;
@@ -131,14 +137,18 @@ struct AttentionArgs {
   const float* q;
   const std::uint16_t* k_cache;  ///< binary16; rotated dims when derived
   const std::uint16_t* v_cache;  ///< binary16
-  /// When non-null (KV-07, sliding layers of a q8_0 cache only;
-  /// rope_pairs == 0), K rows are read from these q8_0 blocks with
-  /// in-kernel dequantization instead of the binary16 cache: the row
-  /// for slot s starts at k_cache_q8 + s * KvCacheRowBytes(
+  /// When non-null (KV-07), K rows are read from these q8_0 blocks
+  /// with in-kernel dequantization instead of the binary16 cache: the
+  /// row for slot s starts at k_cache_q8 + s * KvCacheRowBytes(
   /// kv_heads * head_dim, kQ8_0), one 34-byte block per 32 values in
-  /// row order -- the layout QkvPost (KV-05) writes.
+  /// row order -- the layout QkvPost (KV-05) writes. With rope_pairs
+  /// > 0 (KV-09, derived-key layers) this is instead the packed
+  /// rotated-dims store QkvPost writes for those layers
+  /// (KvCacheRowBytes(kv_heads * 2 * rope_pairs, kQ8_0) per slot);
+  /// every unrotated key dim is read from the V store below.
   const std::uint8_t* k_cache_q8{nullptr};
-  /// Same for V rows (the KV-06 store).
+  /// Same for V rows (the KV-06 store; for derived-key layers the
+  /// normalized K projection, KV-09).
   const std::uint8_t* v_cache_q8{nullptr};
   float* out;
   float* partials;

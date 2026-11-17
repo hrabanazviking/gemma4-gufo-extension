@@ -79,7 +79,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-06 quantize-on-write V + ring | DONE | section below; V roundtrip max_abs_err 0.010000, SNR 48.15 dB; ring max_abs_err 0.006234 |
 | KV-07 dequant-in-decode (sliding) | DONE | section below; q8_0 probes FACT-1/2/3 + LONG-1 identical to the f16 baseline |
 | KV-08 decode correctness + speed gate | DONE | section below; probes byte-identical to f16 + Phase 0 baseline; decode +0.09/+0.27/+0.10 pct vs same-binary f16 (noise) |
-| KV-09 global layers derived-K | PENDING | |
+| KV-09 global layers derived-K | DONE | section below; reconstruction max_abs_err 0.015822, SNR 47.14 dB; probes byte-identical to f16 |
 | KV-10 global validation gate | PENDING | |
 | KV-11 non-WMMA prefill q8_0 | PENDING | |
 | KV-12 WMMA prefill / dispatch rule | PENDING | |
@@ -366,6 +366,86 @@ byte-identical; no decode regression beyond noise at
 512 / 4k / 16k; long-context effect measured and recorded
 (speed-neutral, memory -40.7%). Next (KV-09): global
 layers, the derived-K design (Phase 4).
+
+## Phase 4 first slice (KV-09) -- q8_0 global layers, derived-K
+
+Design (the derived-K question, answered from the code):
+- A global layer stores two rows per token: the V row (2 heads x
+  512 values = 1,024 values; the RMS-normalized K projection, no
+  weight, no rope) and the rotated-K row (2 heads x 128 packed
+  values = 256 values: per head the rotated dims [0, 64) then
+  [256, 320) of K = rope(k_norm . V); pairs = 64).
+- Feasibility: rope is applied BEFORE quantization in both stores
+  and is orthogonal, so reconstruction adds no error of its own:
+  rotated dims carry only their own store's quantization error;
+  unrotated dims are the dequantized V (the query carries k_norm,
+  as in the f16 design). No re-rotation of quantized values ever
+  happens. The host reconstruction proof below lands in the same
+  error family as the sliding stores (SNR 47.14 dB vs 48.25/48.15),
+  so the design is feasible within tolerance -- no fallback is
+  needed from this slice; KV-10 measures it through the real path.
+
+What landed:
+- `kv_cache_format.hpp`: `KvCacheLayerFormat` now returns the
+  cache format for every layer (the KV-07 mixed cache is retired);
+  q8_0 storage is the full 125,440 B/token (was 130,560 mixed;
+  f16 stays 220,160), pinned in the extended test.
+- `hip/kernels.hip.cpp` QkvPost: the V store branch now serves
+  derived-key layers too (their V row quantizes exactly like a
+  sliding V row), plus a new rotated-K branch quantizing the
+  packed rotated dims after rotation -- the segment/wave mapping
+  puts one 32-value block in one wave (WaveMax amax, lane 0 writes
+  the fp16 scale, the KV-05 pattern). `hip/executor.cpp` passes
+  the q8_0 pointers for every layer of a q8_0 cache (Forward and
+  DraftChains), and gives q8_0 layers their FP32 output at
+  prefill widths.
+- Decode read path (split-K, staged tiles): `stage_load` stages
+  the V tile by dequantizing the q8_0 V store into the same
+  binary16 tile the f16 path stages; `rot_load` dequantizes the
+  packed rotated store into the rotated tile; the own-key step
+  reconstructs from the two stores via the new
+  `DequantQ8PackedLane`. Prefill: a q8_0 global layer takes the
+  single-pass kernel like a q8_0 sliding layer, where
+  `AttendKeys` reconstructs derived keys from the two stores;
+  the WMMA dequant-tile stage remains KV-12, and f16 global
+  prefill still takes WMMA exactly as before.
+- `MoveKey` needed no change: it already moves stored-row
+  widths through `KvCacheLayerFormat`, so global rows now move
+  their exact q8_0 bytes (272 B rotated-K row, 1,088 B V row).
+  Guard: the Executor refuses a q8_0 cache by name when a
+  derived-key layer's rotated pairs are not the production 64
+  (the geometry the WMMA path and the staged tiles hardcode).
+- NOT in this slice: KV-10's validation gate (reconstruction
+  error through the real attention path + matrix re-run), and
+  KV-13's snapshot re-proof -- continuation snapshots still size
+  rows binary16 in engine.cpp, as recorded at KV-07, so q8_0
+  sessions must not be snapshotted until KV-13.
+
+Verification (2026-11-17, device):
+- Standalone compile of the registered test -> PASS, including
+  the new derived-K reconstruction check (one global head,
+  K = rope(k_norm . V) rebuilt from the two q8_0 stores):
+  **max abs error 0.015822** (bound 0.04), **SNR 47.14 dB**
+  (bound 30 dB) -- the sliding stores measured 48.25/48.15 dB.
+- nix build of the KV-09 tree: clean (detached unit; store path
+  6h60fbr9...-gufo-0-unstable-4938016). clang-format clean on
+  all touched files.
+- Probes on the KV-09 binary (full harness, labels kv09-f16 /
+  kv09-q8, results device-side): all five answers byte-identical
+  between q8_0 and same-binary f16, and f16 byte-identical to
+  the KV-08 baseline (timing lines excluded) -- FACT-1 `Paris`,
+  FACT-2 `Au`, FACT-3 `366`, COH-1 identical text, LONG-1
+  `47-12-89` (15,739 prompt tokens through serve; prefill and
+  decode both exercised the global q8_0 paths). Error paths
+  unchanged: env `bogus` -> named error; flag `q4_0` ->
+  reserved error.
+- Installed profile and gufo-resident.service untouched;
+  Ollama (:11434) untouched.
+
+Next (KV-10): the Phase 4 validation gate -- reconstruction
+error through the real attention path, probes + matrix re-run,
+and the gate call (full q8_0 vs the mixed-cache fallback) on
+that evidence.
 
 ## Phase gates
 

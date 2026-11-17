@@ -567,6 +567,39 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
         }
       }
     }
+  } else if (a.k_cache_q8 != nullptr && pairs != 0) {
+    // KV-09: q8_0 rotated-K store for derived-key layers. The packed
+    // row holds, per head, the rotated dims [0, pairs) then
+    // [D / 2, D / 2 + pairs), quantized after the rotation. With
+    // pairs a multiple of 32, segment k (0 = low dims, 1 = high
+    // dims) and wave w < pairs / 32 hold exactly packed block
+    // k * (pairs / 32) + w of this head -- one 32-value block per
+    // wave, as in the KV-05 store -- so WaveMax gives the block
+    // amax, each lane writes its own code, lane 0 the fp16 scale.
+    // Matches QuantizeQ8_0Row over the packed row on the host.
+    const std::uint32_t seg_blocks = pairs / 32;
+    const std::size_t row_bytes =
+        (static_cast<std::size_t>(a.kv_heads) * 2 * seg_blocks) * 34;
+    std::uint8_t* row_q8 =
+        a.k_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w) {
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        if (static_cast<std::uint32_t>(w) < seg_blocks) {
+          const std::uint32_t blk = kvh * 2 * seg_blocks + k * seg_blocks + w;
+          std::uint8_t* out = row_q8 + static_cast<std::size_t>(blk) * 34;
+          const float amax = WaveMax(fabsf(v[w][k]));
+          const float dscale = amax / 127.0F;
+          const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
+          out[lane] = static_cast<std::uint8_t>(
+              static_cast<std::int8_t>(roundf(v[w][k] * inv)));
+          if (lane == 0) {
+            *reinterpret_cast<__half*>(out + 32) = __float2half(dscale);
+          }
+        }
+      }
+    }
   } else {
 #pragma unroll
     for (int w = 0; w < kWaves; ++w) {
@@ -585,12 +618,14 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
   }
   load(a.v + row * v_row + std::size_t{kvh} * D, v);
   norm_rope(v, nullptr, false);
-  if (a.v_cache_q8 != nullptr && pairs == 0) {
+  if (a.v_cache_q8 != nullptr) {
     // KV-06: q8_0 V store, the same block layout and slot/ring
     // addressing as the KV-05 K store above: one 32-value block lies
     // in one wave, WaveMax gives the block amax, each lane writes its
     // own code, lane 0 writes the fp16 scale. Matches
-    // QuantizeQ8_0Row on the host.
+    // QuantizeQ8_0Row on the host. KV-09: derived-key layers take
+    // this branch too -- their V row is the normalized K projection,
+    // stored exactly like a sliding V row.
     const std::size_t row_bytes =
         (static_cast<std::size_t>(a.kv_heads) * D / 32) * 34;
     std::uint8_t* row_q8 =
@@ -773,6 +808,33 @@ __device__ inline void DequantQ8Lane(const std::uint8_t* cache_q8,
   }
 }
 
+/// KV-09: dequantizes one lane's P values of a packed q8_0 row whose
+/// heads hold `per_head` values each (the derived-key rotated store:
+/// per_head = 2 * rope_pairs), starting at packed offset `packed0`
+/// of head `kvh`. A lane's values always lie inside one 32-value
+/// block (packed0 is a multiple of P and P divides 32).
+template<int D>
+__device__ inline void DequantQ8PackedLane(const std::uint8_t* cache_q8,
+                                           std::uint32_t slot,
+                                           std::uint32_t kv_heads,
+                                           std::uint32_t kvh,
+                                           std::uint32_t per_head,
+                                           std::uint32_t packed0, float* out) {
+  constexpr int P = D / kWave;
+  const std::size_t row_bytes =
+      (static_cast<std::size_t>(kv_heads) * per_head / 32) * 34;
+  const std::uint8_t* block =
+      cache_q8 + static_cast<std::size_t>(slot) * row_bytes +
+      (static_cast<std::size_t>(kvh) * (per_head / 32) + packed0 / 32) * 34;
+  const float scale =
+      __half2float(*reinterpret_cast<const __half*>(block + 32));
+  const std::uint8_t* codes = block + packed0 % 32;
+#pragma unroll
+  for (int i = 0; i < P; ++i) {
+    out[i] = static_cast<float>(static_cast<std::int8_t>(codes[i])) * scale;
+  }
+}
+
 template<int D>
 __device__ inline void AttendKeys(const AttentionArgs& a, const float* q_lane,
                                   std::uint32_t kvh, std::uint32_t begin,
@@ -789,7 +851,28 @@ __device__ inline void AttendKeys(const AttentionArgs& a, const float* q_lane,
     const std::uint32_t slot = a.ring != 0 ? key % a.ring : key;
     float kf[P];
     float vf[P];
-    if (a.k_cache_q8 != nullptr) {
+    if (a.rope_pairs != 0 && a.v_cache_q8 != nullptr) {
+      // KV-09: derived keys over q8_0 stores. The value is the
+      // dequantized V row; the key dim is the dequantized rotated
+      // store where this lane's dims are rotated dims, and the
+      // dequantized value everywhere else (the query carries
+      // k_norm on those dims): K = rope(k_norm . V) reconstructed
+      // from the two stores, as the binary16 path reads it.
+      DequantQ8Lane<D>(a.v_cache_q8, slot, a.kv_heads, kvh, lane, vf);
+      const std::uint32_t dim0 = static_cast<std::uint32_t>(lane) * P;
+      if (dim0 < a.rope_pairs ||
+          (dim0 >= D / 2 && dim0 < D / 2 + a.rope_pairs)) {
+        const std::uint32_t packed0 =
+            dim0 < D / 2 ? dim0 : a.rope_pairs + dim0 - D / 2;
+        DequantQ8PackedLane<D>(a.k_cache_q8, slot, a.kv_heads, kvh,
+                               2 * a.rope_pairs, packed0, kf);
+      } else {
+#pragma unroll
+        for (int i = 0; i < P; ++i) {
+          kf[i] = vf[i];
+        }
+      }
+    } else if (a.k_cache_q8 != nullptr) {
       // KV-07: this lane's slice of the q8_0 rows, dequantized here.
       DequantQ8Lane<D>(a.k_cache_q8, slot, a.kv_heads, kvh, lane, kf);
       DequantQ8Lane<D>(a.v_cache_q8, slot, a.kv_heads, kvh, lane, vf);
@@ -1154,7 +1237,34 @@ __global__ void __launch_bounds__(kThreads* WPH)
     for (int n = 0; n < kStageLoads / 2; ++n) {
       const std::uint32_t key =
           key0 + static_cast<int>(threadIdx.x) / kGroups + n * kKeysPerPass;
-      if (key >= begin && key < end) {
+      if (key >= begin && key < end && derived && a.v_cache_q8 != nullptr) {
+        // KV-09: stage the V tile from the q8_0 V store. This thread's
+        // two 8-dim chunks (dims 8g and D / 2 + 8g of this head) each
+        // lie in one 32-value block; dequantize them into the staged
+        // binary16 pieces, so the tile the score/value loops consume
+        // is exactly the tile the binary16 path stages.
+        const std::uint32_t slot = slot_of(key);
+        auto* lo = reinterpret_cast<__half*>(&staged[2 * n]);
+        auto* hi = reinterpret_cast<__half*>(&staged[2 * n + 1]);
+#pragma unroll
+        for (int seg = 0; seg < 2; ++seg) {
+          const std::uint32_t dim0 =
+              static_cast<std::uint32_t>(group) * 8 + seg * (D / 2);
+          const std::uint8_t* block =
+              a.v_cache_q8 + static_cast<std::size_t>(slot) * row_bytes_q8 +
+              (static_cast<std::size_t>(blockIdx.y) * (D / 32) + dim0 / 32) *
+                  34;
+          const float scale =
+              __half2float(*reinterpret_cast<const __half*>(block + 32));
+          const std::uint8_t* codes = block + dim0 % 32;
+          __half* dst = seg == 0 ? lo : hi;
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            dst[j] = __float2half(
+                static_cast<float>(static_cast<std::int8_t>(codes[j])) * scale);
+          }
+        }
+      } else if (key >= begin && key < end) {
         const std::uint32_t offset =
             slot_of(key) * row_bytes + group * 8 * sizeof(__half);
         staged[2 * n] = *at(head_cache, offset);
@@ -1197,7 +1307,30 @@ __global__ void __launch_bounds__(kThreads* WPH)
       const int u = static_cast<int>(threadIdx.x) + n * kBlockThreads;
       const std::uint32_t key = key0 + u / rot_chunks;
       staged_rot[n] = uint4{0, 0, 0, 0};
-      if (u < kWave * rot_chunks && key >= begin && key < end) {
+      if (u < kWave * rot_chunks && key >= begin && key < end &&
+          a.k_cache_q8 != nullptr) {
+        // KV-09: the same 8 packed rotated values, dequantized from
+        // the q8_0 rotated store into the staged binary16 piece.
+        const std::uint32_t packed0 =
+            static_cast<std::uint32_t>(u % rot_chunks) * 8;
+        const std::uint32_t per_head = 2 * static_cast<std::uint32_t>(pairs);
+        const std::uint8_t* block =
+            a.k_cache_q8 +
+            static_cast<std::size_t>(slot_of(key)) *
+                (a.kv_heads * (per_head / 32) * 34) +
+            (static_cast<std::size_t>(blockIdx.y) * (per_head / 32) +
+             packed0 / 32) *
+                34;
+        const float scale =
+            __half2float(*reinterpret_cast<const __half*>(block + 32));
+        const std::uint8_t* codes = block + packed0 % 32;
+        auto* dst = reinterpret_cast<__half*>(&staged_rot[n]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          dst[j] = __float2half(
+              static_cast<float>(static_cast<std::int8_t>(codes[j])) * scale);
+        }
+      } else if (u < kWave * rot_chunks && key >= begin && key < end) {
         staged_rot[n] = *at(
             k_rotated, ((slot_of(key) * a.kv_heads + blockIdx.y) * 2 * pairs +
                         (u % rot_chunks) * 8) *
@@ -1493,9 +1626,25 @@ __global__ void __launch_bounds__(kThreads* WPH)
                                  : k_head + slot * stride + dim0;
     float kf[P];
     float vf[P];
-    if (a.k_cache_q8 != nullptr) {
+    if (derived && a.v_cache_q8 != nullptr) {
+      // KV-09: the row's own key and value over the q8_0 global
+      // stores, reconstructed as in AttendKeys: rotated dims from
+      // the rotated store, every other dim its dequantized value.
+      DequantQ8Lane<D>(a.v_cache_q8, static_cast<std::uint32_t>(slot),
+                       a.kv_heads, blockIdx.y, lane, vf);
+      if (rot_offset >= 0) {
+        DequantQ8PackedLane<D>(a.k_cache_q8, static_cast<std::uint32_t>(slot),
+                               a.kv_heads, blockIdx.y, 2 * a.rope_pairs,
+                               static_cast<std::uint32_t>(rot_offset), kf);
+      } else {
+#pragma unroll
+        for (int i = 0; i < P; ++i) {
+          kf[i] = vf[i];
+        }
+      }
+    } else if (a.k_cache_q8 != nullptr) {
       // KV-07: the row's own key and value, dequantized from q8_0
-      // (never set together with `derived`: q8_0 is sliding-only).
+      // (sliding layers; derived layers take the KV-09 branch above).
       DequantQ8Lane<D>(a.k_cache_q8, static_cast<std::uint32_t>(slot),
                        a.kv_heads, blockIdx.y, lane, kf);
       DequantQ8Lane<D>(a.v_cache_q8, static_cast<std::uint32_t>(slot),
@@ -1717,8 +1866,10 @@ void LaunchAttention(const AttentionArgs& a, hipStream_t stream) {
     // KV-07: the WMMA prefill kernel reads binary16 cache tiles; a
     // q8_0 sliding cache takes the single-pass kernel instead, which
     // dequantizes in-kernel (the WMMA dequant-tile stage is KV-12).
+    // KV-09: a q8_0 derived-key (global) layer takes the same road --
+    // AttendKeys reconstructs its keys from the two q8_0 stores.
     if (a.k_cache_q8 != nullptr || !LaunchWmmaPrefillAttention(a, stream)) {
-      if (a.rope_pairs != 0) {
+      if (a.rope_pairs != 0 && a.v_cache_q8 == nullptr) {
         throw std::invalid_argument("derived keys need the WMMA prefill path");
       }
       if (a.out == nullptr) {

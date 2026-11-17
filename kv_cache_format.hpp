@@ -210,15 +210,22 @@ inline void DequantizeQ8_0Row(const std::uint8_t* in, float* row,
   }
 }
 
-/// The format one layer's regions use in a cache whose sliding
-/// layers are stored in `format`: global layers keep binary16 until
-/// the derived-K design lands (KV-09), so a q8_0 cache is a mixed
-/// cache -- sliding rows q8_0, global rows binary16. The write path
-/// (QkvPost), the allocation (Executor::CreateCache/CacheBytes) and
-/// every read path agree on this rule.
+/// The format one layer's regions use in a cache stored in
+/// `format`. Since KV-09 every layer takes the cache format: sliding
+/// rows store full K/V rows; global (derived-key) rows store the V
+/// row (the normalized K projection) and the packed rotated-K dims
+/// row, both as q8_0 blocks, and the attention paths reconstruct
+/// K = rope(k_norm . V) from the dequantized stores (rotated dims
+/// from their own store, every other dim its dequantized value --
+/// rope is orthogonal, so the reconstruction adds no error of its
+/// own). The write path (QkvPost), the allocation
+/// (Executor::CreateCache/CacheBytes) and every read path agree on
+/// this rule. (KV-07/KV-08 shipped a mixed cache -- sliding q8_0,
+/// global binary16 -- through this same function.)
 [[nodiscard]] inline KvCacheFormat KvCacheLayerFormat(KvCacheFormat format,
                                                       bool sliding) noexcept {
-  return sliding ? format : KvCacheFormat::kF16;
+  static_cast<void>(sliding);
+  return format;
 }
 
 /// One layer's cache shape for storage sizing: `slots` rows of

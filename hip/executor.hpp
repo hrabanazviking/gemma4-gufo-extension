@@ -108,8 +108,8 @@ public:
       std::size_t max_cols, std::size_t max_half_cols, std::uint32_t max_rows,
       std::uint32_t max_logit_rows, std::uint32_t max_context);
   /// Per-session cache bytes for per-layer K row widths (KeyWidths).
-  /// A quantized `format` sizes the cache mixed (KV-07): sliding
-  /// layers in `format`, global layers binary16 (KvCacheLayerFormat).
+  /// Every layer is sized in `format` (KvCacheLayerFormat; KV-09
+  /// quantized the global layers' two stores too).
   [[nodiscard]] static std::size_t CacheBytes(
       const Config& config, std::uint32_t max_context, std::uint32_t ring,
       const std::vector<std::uint32_t>& key_widths, std::uint32_t vocab,

@@ -320,20 +320,20 @@ void CheckQ8RingLayout() {
   }
 }
 
-// KV-07: the mixed cache the executor actually allocates in q8_0
-// mode -- sliding layers q8_0, global layers binary16 (KV-09 owns
-// the global design). Per token: 25 sliding x (2,304 + 2,304)
-// aligned q8_0 bytes + 5 global x (1,024 + 2,048) binary16 bytes
-// = 130,560 B, against 220,160 B all-f16 and 125,440 B for the
-// (never allocated) all-q8_0 figure pinned in CheckStorageBytes.
-void CheckMixedStorageBytes() {
+// KV-09: the cache the executor actually allocates in q8_0 mode --
+// every layer q8_0 since the derived-K design landed (KV-07/KV-08
+// shipped the mixed cache: sliding q8_0, global binary16, 130,560
+// B/token). Per token: 25 sliding x (2,304 + 2,304) aligned q8_0
+// bytes + 5 global x (768 rotated-K + 1,280 V) aligned q8_0 bytes
+// = 125,440 B, against 220,160 B all-f16.
+void CheckLayerStorageBytes() {
   using g4::KvCacheFormat;
   Require(g4::KvCacheLayerFormat(KvCacheFormat::kQ8_0, true) ==
               KvCacheFormat::kQ8_0,
           "sliding layer does not take the cache format");
   Require(g4::KvCacheLayerFormat(KvCacheFormat::kQ8_0, false) ==
-              KvCacheFormat::kF16,
-          "global layer is not kept binary16 in a q8_0 cache");
+              KvCacheFormat::kQ8_0,
+          "global layer does not take the cache format");
   Require(
       g4::KvCacheLayerFormat(KvCacheFormat::kF16, true) == KvCacheFormat::kF16,
       "f16 cache layer format wrong");
@@ -345,10 +345,10 @@ void CheckMixedStorageBytes() {
   }
   for (int i = 0; i < 5; ++i) {
     model.push_back({1, 512, 1024});
-    formats.push_back(KvCacheFormat::kF16);
+    formats.push_back(KvCacheFormat::kQ8_0);
   }
-  Require(g4::KvCacheStorageBytesPerLayer(model, formats) == 130560,
-          "mixed q8_0 model bytes/token wrong");
+  Require(g4::KvCacheStorageBytesPerLayer(model, formats) == 125440,
+          "full q8_0 model bytes/token wrong");
   // Uniform formats through the per-layer road reproduce the
   // uniform figures.
   std::vector<KvCacheFormat> all_f16(model.size(), KvCacheFormat::kF16);
@@ -360,6 +360,85 @@ void CheckMixedStorageBytes() {
           "per-layer q8_0 bytes differ from the uniform road");
 }
 
+// KV-09 gate evidence (host half): the derived-K reconstruction
+// over q8_0 stores. One global head (D = 512, pairs = 64): V is a
+// deterministic pseudo-random row in [-2, 2]; the true key is
+// K = rope(k_norm . V) at a fixed position's angles. The stores are
+// the q8_0 V row and the q8_0 packed rotated-dims row (quantized
+// after rotation, as QkvPost stores them). Reconstruction reads
+// rotated dims from the rotated store and every other dim as
+// k_norm * dequantized V (in the kernels the query carries k_norm;
+// the product is the same) -- the exact rule the attention paths
+// implement. Rope is orthogonal and applied before quantization,
+// never to quantized values, so the reconstruction must land within
+// the campaign's recorded bounds with no amplification of its own.
+void CheckDerivedKeyReconstruction() {
+  constexpr std::uint32_t kDim = 512;
+  constexpr std::uint32_t kPairs = 64;
+  std::vector<float> v(kDim);
+  std::uint32_t state = 0x85EBCA6BU;
+  for (std::uint32_t i = 0; i < kDim; ++i) {
+    state = state * 1664525U + 1013904223U;
+    const float u = static_cast<float>(state >> 8) / 16777216.0F;
+    v[i] = u * 4.0F - 2.0F;
+  }
+  std::vector<float> k_norm(kDim);
+  for (std::uint32_t i = 0; i < kDim; ++i) {
+    k_norm[i] = 0.5F + static_cast<float>(i % 7) * 0.25F;
+  }
+  std::vector<float> key(kDim);
+  for (std::uint32_t i = 0; i < kDim; ++i) {
+    key[i] = k_norm[i] * v[i];
+  }
+  for (std::uint32_t i = 0; i < kPairs; ++i) {
+    const double theta = 0.013 * static_cast<double>(i + 1) * 7.0;
+    const float c = static_cast<float>(std::cos(theta));
+    const float s = static_cast<float>(std::sin(theta));
+    const float lo = key[i];
+    const float hi = key[i + kDim / 2];
+    key[i] = lo * c - hi * s;
+    key[i + kDim / 2] = lo * s + hi * c;
+  }
+  std::vector<std::uint8_t> v_store(
+      g4::KvCacheRowBytes(kDim, g4::KvCacheFormat::kQ8_0));
+  g4::QuantizeQ8_0Row(v, v_store.data());
+  std::vector<float> packed(2 * kPairs);
+  for (std::uint32_t i = 0; i < kPairs; ++i) {
+    packed[i] = key[i];
+    packed[kPairs + i] = key[i + kDim / 2];
+  }
+  std::vector<std::uint8_t> k_store(
+      g4::KvCacheRowBytes(2 * kPairs, g4::KvCacheFormat::kQ8_0));
+  g4::QuantizeQ8_0Row(packed, k_store.data());
+  std::vector<float> v_back(kDim);
+  g4::DequantizeQ8_0Row(v_store.data(), v_back.data(), kDim);
+  std::vector<float> packed_back(2 * kPairs);
+  g4::DequantizeQ8_0Row(k_store.data(), packed_back.data(), 2 * kPairs);
+  std::vector<float> rec(kDim);
+  for (std::uint32_t i = 0; i < kDim; ++i) {
+    const std::uint32_t seg = i % (kDim / 2);
+    if (seg < kPairs) {
+      rec[i] = packed_back[i < kDim / 2 ? i : kPairs + i - kDim / 2];
+    } else {
+      rec[i] = k_norm[i] * v_back[i];
+    }
+  }
+  double max_abs = 0.0;
+  double sig = 0.0;
+  double err = 0.0;
+  for (std::uint32_t i = 0; i < kDim; ++i) {
+    const double e = std::fabs(static_cast<double>(rec[i]) - key[i]);
+    max_abs = std::max(max_abs, e);
+    sig += static_cast<double>(key[i]) * key[i];
+    err += e * e;
+  }
+  const double snr_db = 10.0 * std::log10(sig / err);
+  std::printf("q8_0 derived-K reconstruction: max_abs_err=%.6f snr_db=%.2f\n",
+              max_abs, snr_db);
+  Require(max_abs <= 0.04, "derived-K reconstruction max abs error too large");
+  Require(snr_db >= 30.0, "derived-K reconstruction SNR too low");
+}
+
 }  // namespace
 
 int main() {
@@ -367,7 +446,8 @@ int main() {
     CheckParse();
     CheckRowBytes();
     CheckStorageBytes();
-    CheckMixedStorageBytes();
+    CheckLayerStorageBytes();
+    CheckDerivedKeyReconstruction();
     CheckFp16Bits();
     CheckQ8BlockLayout();
     CheckQ8KRowRoundtrip();
