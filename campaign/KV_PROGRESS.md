@@ -1009,3 +1009,120 @@ gufo-resident.service untouched):
 Next: R3 current-chunk bypass (quantize->dequantize
 transformation reproduced in-register; raw unquantized
 values FORBIDDEN); then the R5 gate run.
+
+## Phase 5 REDO R3 -- current-chunk round-trip bypass: AUDIT-ONLY (2026-11-17, builder tick 15:13 EST)
+
+Conclusion first: a correct byte-identical R3 bypass CANNOT be
+built inside the current kernel architecture without a large
+executor rework. Per the redo plan's audit-first rule and this
+slice's hard rule (raw unquantized values FORBIDDEN), nothing
+was implemented and nothing is faked. This entry is the audit
+evidence; no code changed, no build or bench was run, and no
+speed or probe claim is made for R3.
+
+Evidence (all line numbers on HEAD da5cded):
+
+1. Two separate kernel launches, no shared registers or LDS.
+   Executor::Forward runs QkvPost(post, stream_) at
+   hip/executor.cpp:1013 and only then Attention(att, stream_)
+   at hip/executor.cpp:1058, per layer per segment. QkvPost is
+   its own kernel (QkvPostKernel, hip/kernels.hip.cpp:464,
+   launched at hip/kernels.hip.cpp:2156). The redo plan's
+   in-register quantize->dequantize reproduction would have to
+   happen inside WmmaPrefillAttentionKernel
+   (hip/attention_wmma.hip.cpp:240), a different launch: values
+   cannot flow from QkvPost's registers into it. In-register
+   therefore means the attention kernel RECOMPUTING the whole
+   transformation from new inputs (points 2-4).
+
+2. The WMMA prefill kernel has no access to bf16-side (or any
+   pre-cache) current-chunk K/V values. AttentionArgs
+   (hip/kernels.hpp:139) carries exactly: q (the packed FP32
+   queries), k_cache / v_cache (bf16), k_cache_q8 /
+   v_cache_q8, out / partials and shape scalars. There is no
+   projection pointer, and none of the transformation inputs:
+   no k_norm, theta_scale, freq_factors or eps -- those exist
+   only in QkvPostArgs (hip/kernels.hpp:39). Every fetch path
+   in the WMMA kernel reads solely from the caches: the R2
+   fused loaders and DequantQ8Chunk take a.k_cache_q8 /
+   a.v_cache_q8, the f16 road takes a.k_cache / a.v_cache
+   (hip/attention_wmma.hip.cpp fetch lambda, ~lines 424-640).
+   The executor never passes its projection buffers onward:
+   q_source / k_source / v_source (hip/executor.cpp:940-942)
+   feed only post.q / post.k / post.v (line 979 ff.).
+
+3. The raw projection buffers would not be correct inputs
+   anyway. k_ / v_ (scratch, hip/executor.cpp:305-306) hold
+   PRE-transformation projections. The attended values are
+   created inside QkvPostKernel: K = rope(rms(k) * k_norm)
+   (norm_rope at hip/kernels.hip.cpp:569, after load at :565),
+   V = rms(v) with no weight and no rope (load at :651,
+   norm_rope(v, nullptr, false)), and only then quantized per
+   32-value block (amax/127 scale via WaveMax, roundf codes,
+   fp16 scale; K store ~:577, V store ~:658, derived-K store
+   ~:609). Feeding the attention kernel the raw buffers would
+   feed un-normalized, un-rotated values -- a worse violation
+   than the forbidden raw-value feed, not a variant of it.
+
+4. Recomputing the transformation inside the WMMA kernel is a
+   large rework, not a tile-loader switch:
+   - New AttentionArgs fields (FP32 K/V projection pointers
+     with the fused qkv_stride / separate_v layouts the
+     executor juggles at hip/executor.cpp:940-975, plus
+     k_norm, theta_scale, freq_factors, eps) and per-segment
+     plumbing in Executor::Forward (segments share the same
+     scratch rows at row0 offsets).
+   - A duplicate of QkvPost's norm_rope in the attention
+     kernel: per-head RMS over the FULL head dim (for global
+     d512 the norm couples all 16 q8 blocks of a token -- the
+     same coupling R4 records), NEOX rope at each key's own
+     position, then per-32-block amax. QkvPost computes amax
+     with one wave holding exactly one 32-value block;
+     the WMMA chunk mapping (chunk_key / chunk_d8,
+     hip/attention_wmma.hip.cpp ~:395-402) distributes a
+     block's four 8-value chunks across different lanes and,
+     for sliding, different waves (R2-sliding audit), so the
+     amax/scale would need cross-lane and cross-wave
+     reductions plus new synchronization in the fetch path,
+     for both the K and V stores, before any dequantize.
+   - Derived-K globals (R4's domain, interleaved with
+     R2-global in the same kernel): the current chunk's K
+     tile is built from v_next registers plus the rotated-K
+     store, i.e. TWO different quantizations (the V row and
+     the packed rotated row, different block scales) of one
+     normalized projection, both reproduced, plus the
+     K-from-V reconstruction. An R3 that covered only sliding
+     layers would leave the global layers -- essentially all
+     quadratic cost at pp16384 -- on the round trip, so R3
+     cannot be banked honestly without R4's construction.
+   - Boundary definition: the engine's prefill chunk is
+     options_.prefill_chunk (engine.cpp:428), cut further by
+     max_rows, image spans and remainder merging, NOT a
+     multiple of the kernel's 16-key tile (kKeys,
+     hip/attention_wmma.hip.cpp:38; tile loop at :727) in
+     general. The current-chunk keys [first_position,
+     first_position + rows) are well defined per forward, but
+     the boundary tile is a partial tile whose per-key source
+     switch would ride on top of all the plumbing above.
+
+Rejected alternative, recorded so it is not retried as R3:
+QkvPost writing a bf16 side copy of the current chunk for the
+attention kernel to read instead of the q8 cache. That is
+still a global-memory write+read round trip -- wider bytes
+than the q8 round trip it replaces -- so it is not the plan's
+bypass and would predictably lose, not win.
+
+What a real R3 would require (future round, Volmarr's word):
+either (a) fuse QkvPost into the prefill attention kernel for
+the current chunk's rows (one launch owns projection-post and
+attention; the cache write for later forwards still happens),
+or (b) the full plumbing + duplicated norm/rope/quantize of
+point 4. Both are executor-level redesigns beyond one slice.
+
+Next: R5 gate run on the banked R1 + R2-global + R2-sliding
+state (the raised bar: strictly faster than same-binary f16
+at pp512 / pp4096 / pp16384, five probes byte-identical,
+host test PASS). If the gate fails, R7's loop law starts a
+new approach round; this audit is one of its inputs (the
+remaining pp16384 gap after R2 was ~-3.4 pct, and R3 as
+designed cannot be counted toward closing it).
