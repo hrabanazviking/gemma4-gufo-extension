@@ -541,17 +541,45 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
   const std::uint32_t pairs = a.rotated_pairs;
   const std::size_t rot_at =
       (static_cast<std::size_t>(slot) * a.kv_heads + kvh) * 2 * pairs;
+  if (a.k_cache_q8 != nullptr && pairs == 0) {
+    // KV-05: q8_0 K store. One 32-value block lies in one wave: lane
+    // holds dim 32 * (w + kWaves * k) + lane of this head, so WaveMax
+    // gives the block amax and each lane writes its own code; lane 0
+    // writes the fp16 scale. Matches QuantizeQ8_0Row on the host.
+    const std::size_t row_bytes =
+        (static_cast<std::size_t>(a.kv_heads) * D / 32) * 34;
+    std::uint8_t* row_q8 =
+        a.k_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+    constexpr std::uint32_t kBlocksPerHead = D / 32;
 #pragma unroll
-  for (int w = 0; w < kWaves; ++w) {
+    for (int w = 0; w < kWaves; ++w) {
 #pragma unroll
-    for (int k = 0; k < K; ++k) {
-      const std::uint32_t d = dim_of(w, k);
-      if (pairs == 0) {
-        k_cache[cache + d] = __float2half(v[w][k]);
-      } else if (d % (D / 2) < pairs) {
-        // Rotated dims only: [0, pairs) then [D / 2, D / 2 + pairs).
-        k_cache[rot_at + (d < D / 2 ? d : pairs + d - D / 2)] =
-            __float2half(v[w][k]);
+      for (int k = 0; k < K; ++k) {
+        const std::uint32_t blk = kvh * kBlocksPerHead + w + kWaves * k;
+        std::uint8_t* out = row_q8 + static_cast<std::size_t>(blk) * 34;
+        const float amax = WaveMax(fabsf(v[w][k]));
+        const float dscale = amax / 127.0F;
+        const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
+        out[lane] = static_cast<std::uint8_t>(
+            static_cast<std::int8_t>(roundf(v[w][k] * inv)));
+        if (lane == 0) {
+          *reinterpret_cast<__half*>(out + 32) = __float2half(dscale);
+        }
+      }
+    }
+  } else {
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w) {
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        const std::uint32_t d = dim_of(w, k);
+        if (pairs == 0) {
+          k_cache[cache + d] = __float2half(v[w][k]);
+        } else if (d % (D / 2) < pairs) {
+          // Rotated dims only: [0, pairs) then [D / 2, D / 2 + pairs).
+          k_cache[rot_at + (d < D / 2 ? d : pairs + d - D / 2)] =
+              __float2half(v[w][k]);
+        }
       }
     }
   }

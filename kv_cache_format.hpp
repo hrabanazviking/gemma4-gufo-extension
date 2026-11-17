@@ -1,8 +1,11 @@
 #ifndef GUFO_MODELS_GEMMA4_KV_CACHE_FORMAT_HPP_
 #define GUFO_MODELS_GEMMA4_KV_CACHE_FORMAT_HPP_
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -76,6 +79,135 @@ enum class KvCacheFormat : std::uint32_t {
       return (std::size_t{values} + 31) / 32 * 18;
   }
   throw std::invalid_argument("unknown KV cache format");
+}
+
+/// fp16 (binary16) bit conversion, for q8_0 block scales. Standard
+/// round-to-nearest-even encoding; subnormals handled both ways.
+[[nodiscard]] inline std::uint16_t FloatToFp16Bits(float value) noexcept {
+  std::uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::uint32_t sign = (bits >> 16) & 0x8000U;
+  const std::int32_t exp =
+      static_cast<std::int32_t>((bits >> 23) & 0xFFU) - 112;
+  const std::uint32_t mant = bits & 0x7FFFFFU;
+  if (exp >= 31) {
+    return static_cast<std::uint16_t>(sign | 0x7C00U |
+                                      (mant != 0 ? 0x200U : 0U));
+  }
+  if (exp <= 0) {
+    if (exp < -10) {
+      return static_cast<std::uint16_t>(sign);
+    }
+    const std::uint32_t m = mant | 0x800000U;
+    const int shift = 14 - exp;
+    std::uint32_t half = m >> shift;
+    const std::uint32_t rest = m & ((1U << shift) - 1U);
+    const std::uint32_t halfway = 1U << (shift - 1);
+    if (rest > halfway || (rest == halfway && (half & 1U) != 0)) {
+      ++half;
+    }
+    return static_cast<std::uint16_t>(sign | half);
+  }
+  std::uint32_t half = (static_cast<std::uint32_t>(exp) << 10) | (mant >> 13);
+  const std::uint32_t rest = mant & 0x1FFFU;
+  if (rest > 0x1000U || (rest == 0x1000U && (half & 1U) != 0)) {
+    ++half;
+  }
+  return static_cast<std::uint16_t>(sign | half);
+}
+
+[[nodiscard]] inline float Fp16BitsToFloat(std::uint16_t half) noexcept {
+  const std::uint32_t sign = (static_cast<std::uint32_t>(half & 0x8000U) << 16);
+  const std::uint32_t exp = (half >> 10) & 0x1FU;
+  const std::uint32_t mant = half & 0x3FFU;
+  std::uint32_t bits;
+  if (exp == 0x1FU) {
+    bits = sign | 0x7F800000U | (mant << 13);
+  } else if (exp == 0) {
+    if (mant == 0) {
+      bits = sign;
+    } else {
+      // Subnormal: normalize.
+      std::uint32_t m = mant;
+      std::int32_t e = -14;
+      while ((m & 0x400U) == 0) {
+        m <<= 1;
+        --e;
+      }
+      m &= 0x3FFU;
+      bits = sign | (static_cast<std::uint32_t>(e + 127) << 23) | (m << 13);
+    }
+  } else {
+    bits = sign | ((exp + 112U) << 23) | (mant << 13);
+  }
+  float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+/// q8_0 block geometry: 32 values, 34 bytes (KV-05).
+inline constexpr std::uint32_t kQ8_0BlockValues = 32;
+inline constexpr std::uint32_t kQ8_0BlockBytes = 34;
+
+/// Quantizes one 32-value block into `out` (34 bytes): 32 int8 codes
+/// followed by the fp16 scale (little-endian, ggml q8_0 layout).
+/// scale = max|v| / 127; a zero block stores a zero scale and codes.
+/// This is the host reference for the QkvPost device store (KV-05);
+/// the kernel computes the same values (its scale passes through
+/// __float2half, which may differ by at most the fp16 rounding the
+/// host conversion also applies).
+inline void QuantizeQ8_0Block(const float* values, std::uint8_t* out) {
+  float amax = 0.0F;
+  for (std::uint32_t i = 0; i < kQ8_0BlockValues; ++i) {
+    amax = std::max(amax, std::fabs(values[i]));
+  }
+  const float scale = amax / 127.0F;
+  const float inv = scale != 0.0F ? 1.0F / scale : 0.0F;
+  for (std::uint32_t i = 0; i < kQ8_0BlockValues; ++i) {
+    out[i] = static_cast<std::uint8_t>(
+        static_cast<std::int8_t>(std::round(values[i] * inv)));
+  }
+  const std::uint16_t scale_bits = FloatToFp16Bits(scale);
+  out[32] = static_cast<std::uint8_t>(scale_bits & 0xFFU);
+  out[33] = static_cast<std::uint8_t>(scale_bits >> 8);
+}
+
+/// Inverse of QuantizeQ8_0Block.
+inline void DequantizeQ8_0Block(const std::uint8_t* in, float* values) {
+  const auto scale_bits = static_cast<std::uint16_t>(
+      in[32] | (static_cast<std::uint16_t>(in[33]) << 8));
+  const float scale = Fp16BitsToFloat(scale_bits);
+  for (std::uint32_t i = 0; i < kQ8_0BlockValues; ++i) {
+    values[i] = static_cast<float>(static_cast<std::int8_t>(in[i])) * scale;
+  }
+}
+
+/// Quantizes a whole row of `values` values (a K or V cache row)
+/// into `out`, which must hold KvCacheRowBytes(values, kQ8_0)
+/// bytes. A partial tail block is zero-padded before quantizing.
+inline void QuantizeQ8_0Row(std::span<const float> row, std::uint8_t* out) {
+  float block[kQ8_0BlockValues];
+  for (std::size_t at = 0; at < row.size(); at += kQ8_0BlockValues) {
+    const std::size_t n =
+        std::min<std::size_t>(kQ8_0BlockValues, row.size() - at);
+    for (std::size_t i = 0; i < kQ8_0BlockValues; ++i) {
+      block[i] = i < n ? row[at + i] : 0.0F;
+    }
+    QuantizeQ8_0Block(block, out + (at / kQ8_0BlockValues) * kQ8_0BlockBytes);
+  }
+}
+
+/// Inverse of QuantizeQ8_0Row for `values` values.
+inline void DequantizeQ8_0Row(const std::uint8_t* in, float* row,
+                              std::size_t values) {
+  for (std::size_t at = 0; at < values; at += kQ8_0BlockValues) {
+    float block[kQ8_0BlockValues];
+    DequantizeQ8_0Block(in + (at / kQ8_0BlockValues) * kQ8_0BlockBytes, block);
+    const std::size_t n = std::min<std::size_t>(kQ8_0BlockValues, values - at);
+    for (std::size_t i = 0; i < n; ++i) {
+      row[at + i] = block[i];
+    }
+  }
 }
 
 /// One layer's cache shape for storage sizing: `slots` rows of

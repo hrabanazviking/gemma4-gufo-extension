@@ -423,8 +423,9 @@ std::unique_ptr<KvCache> Executor::CreateCache(std::uint32_t max_context,
     if (error_msg != nullptr) {
       *error_msg = "KV cache format '" +
                    std::string(KvCacheFormatName(kv_format_)) +
-                   "' is not built yet (KV campaign Phase 1: format and "
-                   "allocation only); use f16";
+                   "' is not built yet (KV campaign: K quantize-on-"
+                   "write landed in KV-05; V store and decode read "
+                   "paths land in KV-06/KV-07); use f16";
     }
     return nullptr;
   }
@@ -966,6 +967,14 @@ void Executor::Forward(std::span<const Segment> segments,
       post.freq_factors = sliding ? nullptr : model_.rope_factors();
       post.k_cache = cache.k[l];
       post.v_cache = cache.v[l];
+      // KV-05: sliding layers store K as q8_0 when the cache format
+      // says so. Unreachable today -- CreateCache still refuses q8_0
+      // until the V store (KV-06) and the decode read path (KV-07)
+      // land -- so f16 behavior is unchanged; the wiring is in place
+      // for the slice that lifts the refusal.
+      post.k_cache_q8 = cache.format == KvCacheFormat::kQ8_0 && sliding
+                            ? reinterpret_cast<std::uint8_t*>(cache.k[l])
+                            : nullptr;
       post.rows = seg.rows;
       post.heads = c.num_heads;
       post.kv_heads = c.kv_heads[l];
