@@ -1352,3 +1352,92 @@ predicted (rotated-K is at most about a fifth of global fetch
 traffic). Per R7 loop law, the next round takes on the LDS
 bf16 round-trip itself. Phase 6 (KV-13) does NOT start. No
 quantized mode becomes any default.
+
+## Phase 5 REDO R7 round 3 -- LDS bf16 round-trip: AUDIT-ONLY (2026-11-17)
+
+AUDIT-ONLY. No code change, no build, no bench, no gate
+claim this tick. Evidence verified on device this tick in
+hip/attention_wmma.hip.cpp (988 lines).
+
+### What the LDS round-trip is
+
+- LDS arrays (lines 255-263): k_lds[kKeys * kKStride] and
+  vt_lds[D * kVtStride] as __half, plus s_lds (260),
+  p_lds (261), row_scale / row_sum (262-263).
+  Constants: kKeys = 16 (line 38), kSlice = 128 (39),
+  kSliceSteps = kSlice / 16 (40), kKStride = D + 8 (251),
+  kVtStride = kKeys + 8 (252), kWavesPerRow = D / kSlice
+  (247).
+- Sizes: global D = 512: k_lds 16 * 520 * 2 = 16,640 B,
+  vt_lds 512 * 24 * 2 = 24,576 B (~41 KiB K+V alone).
+  Sliding D = 256: k_lds 16 * 264 * 2 = 8,448 B,
+  vt_lds 256 * 24 * 2 = 12,288 B (~20.7 KiB K+V).
+- Round-trip shape: the R2 fused loaders dequantize q8
+  into registers (k_next / v_next uint4, lines 366-367;
+  fetch lambda at 421, dequant paths through ~640);
+  store_keys (660) and store_values (685, includes the V
+  transpose via DPP/perm) write bf16 into k_lds / vt_lds;
+  the QK loop (~775-777) and PV loop (~867-876) LoadFrag
+  from LDS (LoadFrag at 162) and Wmma (42). There is NO
+  separate global bf16 scratch/staging pass -- the
+  round-trip is register -> LDS bf16 -> register
+  fragment, per 16-key tile, with 3 __syncthreads per
+  tile in the main loop (784, 839, 881, plus the initial
+  760), and the next tile is already prefetched into
+  registers while the current tile computes (fetch at
+  loop top 768, store_keys after scores at 837,
+  store_values after PV at 883).
+
+### Why LDS exists here
+
+- The tile is shared by the whole GQA group / all waves
+  in the workgroup (kWavesPerRow = D / 128: 4 global,
+  2 sliding). V must be transposed for PV WMMA, and WMMA
+  fragments are lane-layout specific (Wmma at 42,
+  LoadFrag at 162). Each wave reads the same K tile for
+  its own 128-dim slice, so dequantizing once into LDS
+  is shared; keeping K/V in registers per-wave would
+  duplicate dequant per wave.
+
+### Candidate mechanisms (honest assessment)
+
+- (A) int8-resident LDS tile + dequant-on-LoadFrag --
+  halves K+V LDS, but repeats dequant per wave/slice
+  read, needs manual fragment construction + per-32
+  scale handling in fragment layout, large kernel
+  rework, gain uncertain (gfx1151 int8 WMMA = bf16 rate
+  per redo plan; win only on LDS traffic/capacity).
+- (B) Direct register fragments via cross-lane shuffles
+  bypassing LDS -- fetch distribution (chunks across
+  lanes/waves, see R2/R3 audits) does not match WMMA
+  fragment lane ownership; requires cross-lane/cross-wave
+  redistribution at least as costly as LDS, similar class
+  to R3's proven-large executor/kernel rework.
+- (C) Narrow wins: padding/stride trimming (kKStride +8,
+  kVtStride +8 exist for bank-conflict avoidance --
+  removing risks conflicts, saves little),
+  double-buffering (already effectively prefetched in
+  registers; AMD guide note in redo plan says measure
+  single vs double, do not assume). None is a small slice.
+
+### Conclusion
+
+No small, bit-identical LDS-elimination slice exists in
+the current architecture. The next implementation round
+must choose ONE of: (A) int8-resident K tile only
+(bounded: K is read kSliceSteps times per wave for QK,
+V transpose path untouched -- spec it as the recommended
+bounded experiment, with decision rule: bank only if
+probes byte-identical + host PASS, and claim gate only
+via a separate R5 run) or stop and take R6 experiments /
+ask Volmarr about executor-level redesign. Do NOT
+implement anything this tick. Next step after this audit:
+implement (A) as a bounded experiment in a following
+tick, or R6 if (A) audit-on-implementation fails.
+
+### Tick state
+
+MemAvailable was ~124,413,940 kB at keeper tick start
+(re-checked ~124,409,608 kB this tick), no live
+build/bench, Ollama :11434 and gufo-resident untouched,
+Phase 6 / KV-13 does NOT start, no quantized default.
