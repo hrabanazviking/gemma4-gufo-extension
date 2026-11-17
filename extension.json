@@ -53,6 +53,13 @@
       "help": "Prefill copies of the projections: off, compact or decoded (default: off)"
     },
     {
+      "name": "--kv-cache-type",
+      "type": "string",
+      "commands": ["serve", "bench", "prompt", "chat"],
+      "providers": ["gemma4"],
+      "help": "KV cache storage format: f16 or q8_0 (default: f16; env GUFO_KV_CACHE_TYPE)"
+    },
+    {
       "name": "--image-tokens",
       "type": "integer",
       "commands": ["serve", "prompt", "chat"],
