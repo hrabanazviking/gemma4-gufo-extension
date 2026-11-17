@@ -744,3 +744,59 @@ probes byte-identical, kv_cache_format test PASS. Redo slices
 track under KV-11/KV-12. Next step for the next builder/keeper
 tick: R1 layout audit of the QkvPost write path and the WMMA
 tile reads, recorded here, then R2-global.
+
+## Phase 5 REDO R1 -- layout audit (2026-11-17, keeper tick 12:44 EST)
+
+Audited on device at banked head 6bab2c8. MemAvailable ~124 GiB
+at tick open; no build/bench this tick (audit only); Ollama
+(:11434) and gufo-resident.service untouched.
+
+Writer (hip/kernels.hip.cpp QkvPostKernel, KV-05/06/09):
+- K, V and the packed rotated-K row are all written in the
+  interleaved ggml q8_0 block layout: row stride
+  kv_heads * (D/32) * 34 bytes (rotated row:
+  kv_heads * 2 * (pairs/32) * 34); block index
+  kvh * (D/32) + dim/32; each 34-byte block holds 32 int8
+  codes at bytes [0,32) and the fp16 scale at bytes [32,34).
+  There is NO separate scale plane and NO tile-major order:
+  the audit precondition in KV_PHASE5_REDO.md R1 is met --
+  the layout IS the interleaved one.
+
+WMMA reader (hip/attention_wmma.hip.cpp DequantQ8Chunk):
+- Same block arithmetic: block = cache + slot*row_bytes +
+  (kvh*(per_head/32) + dim0/32) * 34; scale read from
+  block+32; the chunk's 8 codes come from one packed 8-byte
+  memcpy at block + dim0%32 (KV-12b).
+- Coalescing verdict: reads do NOT coalesce cleanly. In the
+  tile fetch, consecutive lanes cover different keys, so a
+  wave's chunk loads are 8-byte loads strided by the full
+  row_bytes; the four 8-value chunks of one 32-value block
+  are issued by different lanes, and the block's fp16 scale
+  is re-read once per chunk (4x per block). Useful bytes per
+  block are eventually all consumed, but no single wave
+  request spans contiguous addresses, unlike the f16 road's
+  16-byte uint4 loads. Recorded honestly: this is strided
+  gather, not coalesced streaming.
+
+Blast radius of a layout change (why R1 is not a one-file
+edit): every consumer of the KV q8_0 layout must agree --
+QkvPostKernel writer (3 stores), the WMMA reader, the
+KV-11 split-kernel readers and the decode dequant helpers
+in hip/kernels.hip.cpp (lines ~797, ~825, ~1092, ~1185,
+~1256, ~1320), kv_cache_format.hpp row-byte math
+(KvCacheRowBytes / kQ8_0BlockBytes), the host
+QuantizeQ8_0Row reference, and the kv_cache_format test's
+pinned byte figures. Phases 2-4 gates passed on THIS
+layout, so a layout switch must re-run the decode and
+validation spot gates, not only the Phase 5 matrix.
+
+Decision (recorded before R2 starts, per the redo plan):
+R1 layout change is WARRANTED by this audit, and it is
+sequenced as the first step of the R2-global slice, under
+a versioned layout flag, so the fused dequant-on-load
+loader is written once against the new separate-scale-
+plane, per-(head, token-tile, d)-contiguous layout instead
+of twice. Next tick: R2-global step 1 -- layout flag +
+writer + scale plane, decode/split readers switched in
+the same slice, kv_cache_format test updated and PASS,
+probes byte-identical before any speed claim.
