@@ -78,7 +78,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-05 quantize-on-write K (sliding) | DONE | section below; roundtrip max_abs_err 0.010000, SNR 48.25 dB |
 | KV-06 quantize-on-write V + ring | DONE | section below; V roundtrip max_abs_err 0.010000, SNR 48.15 dB; ring max_abs_err 0.006234 |
 | KV-07 dequant-in-decode (sliding) | DONE | section below; q8_0 probes FACT-1/2/3 + LONG-1 identical to the f16 baseline |
-| KV-08 decode correctness + speed gate | PENDING | |
+| KV-08 decode correctness + speed gate | DONE | section below; probes byte-identical to f16 + Phase 0 baseline; decode +0.09/+0.27/+0.10 pct vs same-binary f16 (noise) |
 | KV-09 global layers derived-K | PENDING | |
 | KV-10 global validation gate | PENDING | |
 | KV-11 non-WMMA prefill q8_0 | PENDING | |
@@ -322,12 +322,58 @@ Next (KV-08): the Phase 3 gate -- probe set + logit comparison
 vs the Phase 0 reference and the decode matrix vs baseline at
 512 / 4k / 16k.
 
+## Phase 3 gate slice (KV-08) -- decode correctness + speed gate
+
+What was measured (2026-11-17, device, KV-07 binary
+`result` -> /nix/store/bczcs2gx...-gufo-0-unstable-4938016;
+MemAvailable ~91 GB at run start):
+
+- Full harness matrix run twice on the same binary: label
+  kv08-q8 (GUFO_KV_CACHE_TYPE=q8_0, 07:52) and label kv08-f16
+  (08:01); 1 warmup + 5 measured per config, medians below.
+  Raw logs device-side in results/kv08-q8/ and results/kv08-f16/.
+- Probes (greedy, seed 42): FACT-1 Paris, FACT-2 Au,
+  FACT-3 366, LONG-1 47-12-89, and COH-1 -- the q8_0 answers
+  are byte-identical to the same-binary f16 run AND to the
+  Phase 0 baseline, all five, including the open-ended COH-1
+  (KV-07 smoke run had shown COH-1 wording drift; the full
+  gate run shows none).
+- Logit comparison: no logit-dump tool ships (KV-01 note), so
+  the comparison is the frozen greedy argmax paths above.
+  --validate-prefill 512 was run on this binary
+  (results/kv08-f16/validate-prefill.log): core bench parses
+  the flag but only the qwen drivers consume it -- for gemma4
+  it is inert (plain bench table, no validation output), so
+  no claim is made from it.
+- Decode medians (tok/s), q8_0 vs same-binary f16: tg512
+  42.70 vs 42.66 (+0.09%), tg4096 41.32 vs 41.21 (+0.27%),
+  tg16384 39.84 vs 39.80 (+0.10%). Vs the Phase 0 baseline
+  (42.69 / 41.18 / 39.90): +0.02% / +0.34% / -0.15%. All
+  within run-to-run noise -- no decode regression at
+  512 / 4k / 16k.
+- Long-context, recorded either way as the gate requires:
+  NO decode speed improvement at 16k (tg16384 +0.10% vs
+  same-binary f16). The q8_0 win at this phase is memory,
+  not speed: mixed cache 130,560 B/token vs 220,160 f16
+  (-40.7%; KV-07). Prefill on this pair (Phase 5 owns that
+  gate): pp512 2224.94 vs 2200.08, pp4096 2915.90 vs
+  2919.11, pp16384 2529.54 vs 2536.48 -- noise.
+- Installed profile and gufo-resident.service untouched;
+  Ollama (:11434) untouched.
+
+**Phase 3 gate: PASSED** 2026-11-17 -- probes pass
+byte-identical; no decode regression beyond noise at
+512 / 4k / 16k; long-context effect measured and recorded
+(speed-neutral, memory -40.7%). Next (KV-09): global
+layers, the derived-K design (Phase 4).
+
 ## Phase gates
 
 - Phase 0 gate: PASSED 2026-11-17 — harness committed (KV-01),
   baseline table + probe answers banked (KV-02).
 - Phase 1 gate: PASSED 2026-11-17 — evidence below.
 - Phase 2 gate: PASSED 2026-11-17 — evidence in the KV-06 section above.
+- Phase 3 gate: PASSED 2026-11-17 -- evidence in the KV-08 section above.
 
 ## Phase 1 (KV-03 + KV-04) — format field, allocation, plumbing
 
