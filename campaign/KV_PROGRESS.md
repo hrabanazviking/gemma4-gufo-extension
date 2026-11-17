@@ -70,7 +70,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | Slice | Status | Evidence |
 |---|---|---|
 | KV-01 harness | DONE | campaign/kv-harness/ (run_matrix.sh, run_probes.sh, probes.txt) + this file |
-| KV-02 f16 baseline | IN PROGRESS | harness run label: baseline-f16 |
+| KV-02 f16 baseline | DONE | table below; raw logs results/baseline-f16/ (device-side) |
 | KV-03 format field + allocation | PENDING | |
 | KV-04 GUFO_KV_CACHE_TYPE plumbing | PENDING | |
 | KV-05 quantize-on-write K (sliding) | PENDING | |
@@ -88,11 +88,51 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 
 ## Baseline (KV-02) — f16, current build (4f73737)
 
-TO BE FILLED by the harness run. Table: pp/tg at 512 / 4k / 16k
-(median of 5), KV bytes/token, probe answers + greedy reference
-paths under campaign/kv-harness/results/baseline-f16/.
+Measured 2026-11-17; median of 5 (1 warmup discarded), machine
+otherwise idle, MemAvailable 124,734,920 kB at start. Raw logs:
+`campaign/kv-harness/results/baseline-f16/` (device-side).
+
+| Metric | Median tok/s |
+|---|---|
+| Prefill pp512 | 2237.76 |
+| Prefill pp4096 | 2939.85 |
+| Prefill pp16384 | 2545.34 |
+| Decode tg128 @ ~512 ctx | 42.69 |
+| Decode tg128 @ ~4k ctx | 41.18 |
+| Decode tg128 @ ~16k ctx | 39.90 |
+
+KV bytes/token (f16, all 30 layers): **220,160 B (215.0 KiB)** —
+25 sliding × 8,192 B + 5 global × 3,072 B (V-store 2,048 +
+rotated-K store 1,024). Sliding growth is ring-capped in long
+sessions; the figure is the nominal per-token rate. At 16k
+context the KV regions total ≈ 3.52 GiB plus fixed per-session
+extras (hidden/ahead/logits/draft) that do not scale with tokens.
+
+Probe answers (greedy, seed 42; full text in
+results/baseline-f16/probes/):
+- FACT-1: `Paris` ✓ · FACT-2: `Au` ✓ · FACT-3: `366` ✓
+- COH-1: two-sentence fox story, coherent and on-prompt ✓
+- LONG-1: `47-12-89` ✓ (needle recalled; prompt_tokens 15,739)
+
+Reference logits: no logit-dump tool ships; the frozen greedy
+probe answers above are the reference. Short probes reproduced
+byte-identically across three runs — the harness is deterministic.
+
+Harness lessons (paid for once, recorded so nobody pays twice):
+- `gufo prompt` has NO `--context` option; its session context is
+  fixed at 4096 and the engine's "increase --context" error text
+  does not apply to it. Long probes run through a throwaway
+  `gufo serve llm --context 32768` (run_probes.sh).
+- Serve's HTTP layer binds before the model loads; chat
+  completions answer 503 "Loading model" until ready and
+  /v1/models is not a readiness signal — the probe POST retries
+  on 503.
+- Size long-probe filler by measured tokens (usage.prompt_tokens),
+  never by character estimates: a first "16k" draft measured
+  36,459 tokens and overflowed with a clean 400.
 
 ## Phase gates
 
-- Phase 0 gate: PENDING — baseline table below + harness committed.
+- Phase 0 gate: PASSED 2026-11-17 — harness committed (KV-01),
+  baseline table + probe answers banked (KV-02).
 - Phase 1 gate: PENDING.
