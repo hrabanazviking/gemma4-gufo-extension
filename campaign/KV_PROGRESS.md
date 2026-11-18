@@ -85,8 +85,8 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-12 WMMA prefill / dispatch rule | SUPERSEDED BY REDO 2026-11-17, GATE OPEN | section below; WMMA dequant-tile stage landed, probes byte-identical; pp16384 -2.98 pct vs f16 is real, beyond noise -- Phase 5 gate not yet passed |
 | KV-13 machinery re-proof | DONE | section below; snapshot machinery made format-aware and re-proven in both formats; MoveKey kernel-proven byte-exact over q8_0; MTP chain named gap (no draft GGUF on this machine) |
 | KV-14 full-stack integration | DONE | section below; supervisor resolves + explicitly passes GUFO_KV_CACHE_TYPE (f16 default), meta reports kv_cache_type; f16 and q8_0 loads both proven, f16 restored |
-| KV-15 resident service re-proof | PENDING | |
-| KV-16 soak + default decision + close | PENDING | |
+| KV-15 resident service re-proof | DONE | section below; Phase 7 gate passed 2026-11-18 |
+| KV-16 soak + default decision + close | DONE | section below; Phase 8 gate passed 2026-11-18 |
 
 ## Baseline (KV-02) — f16, current build (4f73737)
 
@@ -2469,3 +2469,61 @@ cache format, which its meta surface reports as q8_0. Slices
 banked: 14 of 16 (KV-01..KV-11, KV-13, KV-14, KV-15). Next:
 KV-16 (Phase 8 soak, final table, close-out; Decision 3 is the
 default decision).
+
+## Phase 8 (KV-16) -- soak, final table, default decision, close
+
+Keeper tick 2026-11-18 02:26-02:45 EST, purpleraider;
+MemAvailable ~124 GiB throughout (above the 40 GiB floor);
+Ollama :11434 untouched (answered 0.40.16 throughout).
+
+Soak (through the resident service, /api/chat, 3-turn
+conversation over a planted harbor-log document, 95,719 chars;
+real tokenizer counts from the service):
+- Turn 1 prompt_eval_count 20,909 tokens (16k+ requirement
+  met with margin); conversation at 20,945 tokens by turn 2.
+- q8_0 active: turn walls 18.5 / 14.6 / 14.1 s. All three
+  planted watchwords recalled in order (THISTLE-9241,
+  EMBER-3177, HALCYON-6082); harbormaster named correctly
+  (Baldur Sigridsson); keep_alive 0 unloaded, /api/ps empty.
+  SOAK PASS.
+- f16 (production default): same document, same recall, all
+  needles + name correct; turn walls 13.1 / 9.3 / 8.9 s;
+  clean unload. SOAK PASS. The wall gap on the long turns is
+  the known pp16384 prefill gap, seen end-to-end.
+- Service restored to resting f16 default afterwards
+  (drop-in removed, /api/version f16, /api/ps empty).
+
+Final benchmark table (banked gate evidence; medians of 5,
+warmup discarded, same-binary comparisons):
+- KV bytes/token: f16 220,160 B (215.0 KiB) vs full q8_0
+  125,440 B -- 43 pct smaller (sliding layer 8,192 -> 4,352
+  B/token). Source: KV-02/KV-03/KV-09 sections.
+- Decode tg128 (KV-08 gate): q8_0 vs f16 +0.09 / +0.27 /
+  +0.10 pct at ~512 / ~4k / ~16k ctx -- parity. Baseline f16
+  tg128: 42.69 / 41.18 / 39.90 tok/s (KV-02).
+- Prefill (Phase 5 REDO R5 gate run, the last full gate-grade
+  matrix): pp512 q8 2207.91 vs f16 2190.91 (+0.78 pct);
+  pp4096 2882.42 vs 2886.76 (-0.15 pct, inside spread,
+  not faster); pp16384 2446.69 vs 2528.64 (-3.24 pct, tight
+  spreads, real). Baseline f16 (KV-02): pp512 2237.76,
+  pp4096 2939.85, pp16384 2545.34 tok/s.
+- Correctness at every gate: probes byte-identical q8_0 vs
+  f16 (timing lines excluded); roundtrip SNR 47-48 dB.
+
+Default decision: Decision 3 (owner ruling 2026-11-18,
+commit 28be04d) -- f16 KV stays the production default on
+purpleraider; q8_0 ships as a proven opt-in via
+GUFO_KV_CACHE_TYPE=q8_0. The table supports it under the
+roadmap's own rule: q8_0 does not tie or win everywhere
+(pp16384 prefill trails ~3.2 pct), so it does not become
+the default. No quantized mode was made a default at any
+point in this campaign.
+
+**Phase 8 gate: PASSED** 2026-11-18 -- the table, the
+decision, and the evidence agree. Slices banked: 15 of 16
+(KV-01..KV-11, KV-13..KV-16). KV-12 stands SUPERSEDED BY
+REDO as recorded; the Phase 5 raised-bar speed gate was
+retired as a shipping gate by Decision 3, and the speed
+hunt continues as a separate line over Gufo core and this
+extension -- it is not part of this roadmap's close.
+Closure record: campaign/STATE.md.

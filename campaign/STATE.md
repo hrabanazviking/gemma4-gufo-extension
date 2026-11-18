@@ -98,3 +98,23 @@ approach (bar: q8_0 prefill faster than f16 at 512/4096/16384,
 probes byte-identical; loop until success). Plan banked at
 `campaign/KV_PHASE5_REDO.md`; the KV-12 staging commit stays
 as history with its gate open. Details in KV_PROGRESS.md.
+
+## KV Q8_0 campaign -- CLOSED 2026-11-18
+
+Roadmap campaign/KV_Q8_ROADMAP.md is complete as closed:
+15 of 16 slices banked DONE (KV-01..KV-11, KV-13..KV-16);
+KV-12 superseded by the Phase 5 REDO, whose raised-bar
+speed gate was retired as a shipping gate by the owner's
+Decision 3 (2026-11-18). Final state of the line:
+
+- q8_0 KV cache is available via GUFO_KV_CACHE_TYPE=q8_0,
+  proven correct (probes byte-identical to f16 at every
+  gate; 20,909-token resident-service soak passed in both
+  formats), 43 pct smaller than f16 (125,440 vs 220,160
+  B/token), decode at parity, prefill at parity at 512/4k
+  and ~3.2 pct behind at 16k.
+- Production default on purpleraider is f16 (Decision 3);
+  q8_0 is a proven opt-in, never a default.
+- The pp16384 speed hunt continues outside this roadmap
+  as a new line over Gufo core and this extension.
+- Full evidence: campaign/KV_PROGRESS.md (Phase 8 section).
