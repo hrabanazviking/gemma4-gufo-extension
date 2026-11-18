@@ -2096,3 +2096,72 @@ this docs commit, so no lock remains at tick end. Only
 this ledger is banked; the part-2 code stays uncommitted
 in the tree for the next round, and the untracked
 diff3 harness + results/ dirs stay uncommitted.
+
+## Phase 5 REDO R3-E1 road (a) + part 2 BANKED -- QkvPost strict TU, staged reproduction bit-identical (2026-11-17, builder tick 22:48 EST)
+
+Road (a) from the part-2 root-cause section, taken as its own
+slice and banked together with the part-2 code it unblocks:
+
+- 77981f6: QkvPostKernel, its launcher QkvPost and the
+  StoreQ8PlainBlocks helper moved verbatim from
+  hip/kernels.hip.cpp into the new hip/qkv_post.hip.cpp.
+  extension.cmake compiles the new TU in the strict group
+  (${_gemma4_hip_options} -fno-fast-math -ffp-contract=off,
+  same as attention_wmma.hip.cpp). Helpers shared with the
+  kernels left behind (XorLane / MaxXorLane / WaveMax /
+  WaveSum, RmsScale, RopeAngle, the q8_0 layout helpers) are
+  private copies in the new TU; the moved block diffed
+  byte-identical against the original, and the kernels.hip.cpp
+  diff is pure deletion. No arithmetic, order or rounding
+  changed anywhere -- only the TU's compiler options, so
+  QkvPost outputs shift by ulps everywhere BY DESIGN.
+- 0f33e89: R3-E1 part 2 proper (the tick-start uncommitted
+  diff, +194 attention_wmma / +12- kernels.hpp): the WMMA
+  prefill LDS-staged reproduction for sliding D=256 q8_0.
+  The TEMP GUFO_R3_STAGED / GUFO_R3_DEBUG diagnostic is
+  REMOVED in this commit -- the staged road is the only road
+  (the getenv/fprintf block is gone; LaunchWmmaPrefillAttention
+  passes the args through untouched). One clang-format include
+  reorder (cstdio/cstdlib) rides along in attention_wmma.
+
+Verification (2026-11-17, device; binary result-roada ->
+/nix/store/qarhk7dpdw94vif0f2r7lrvdc34mhlwx-gufo-0-unstable-4938016;
+MemAvailable 124,193,244 kB at tick start and about 124 GiB
+throughout, above the 40 GiB floor; Ollama :11434 and
+gufo-resident.service untouched):
+- nix build clean (detached transient unit, exit 0; binary
+  produced). First attempt failed only because the flake
+  source omits untracked files; the new TU was staged and
+  the rebuild was clean.
+- clang-format clean on all touched files (qkv_post.hip.cpp,
+  kernels.hip.cpp, attention_wmma.hip.cpp, kernels.hpp).
+- Host kv_cache_format test PASS (standalone compile),
+  roundtrip numbers identical to R2 / part 1: K 0.010000 /
+  48.25 dB, V 0.010000 / 48.15 dB, ring 0.006234, derived-K
+  0.015822 / 47.14 dB.
+- Probes (labels roada-q8 / roada-f16, same binary
+  result-roada/bin/gufo, GUFO_KV_CACHE_TYPE per label): all
+  five byte-identical q8_0 vs same-binary f16, Model Load
+  timing line excluded (FACT-1 Paris, FACT-2 Au, FACT-3 366,
+  COH-1 same fox text, LONG-1 47-12-89). THE decisive check:
+  with the staged road always on, COH-1 in q8_0 now matches
+  the f16 text -- last tick staged ON diverged. The staged
+  reproduction is bit-identical to the strict-TU QkvPost on
+  the real model.
+- Differential harness diff3 (exact-COH-shape set N-R,
+  harness copy run_roada_diff3.sh with the new TU added):
+  ALL BIT-IDENTICAL, 0 floats differ in every case (N/O/P/R
+  0/110592, Q 0/262144). The diff/diff2 sets (A-M) were not
+  re-run this tick; they were bit-identical last tick and
+  the harness compiles all TUs under uniform strict flags.
+
+No gate claimed this tick: the Phase 5 R5 bench gate has
+NOT re-run. Next step: R3-E2 (global D=512 staged
+reproduction), then the R5 gate run. Phase 6 (KV-13) does
+not start; no quantized mode becomes any default.
+
+Tick state: lock held during the work and removed before
+this docs commit, so no lock remains at tick end. Untracked
+kv-harness diff sources, the run_roada_diff3.sh copy and
+results/ dirs (incl. roada-q8 / roada-f16) stay uncommitted,
+as ordered.
