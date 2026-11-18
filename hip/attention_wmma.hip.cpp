@@ -301,9 +301,17 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   // fp16 scales) bytes for K, then the same for V -- one KV head,
   // layout v2 per key (272-byte rows), 8704 bytes total.
   // stage_tile() fills it per tile; fetch() reads current keys
-  // from it. One byte in every other instantiation.
-  __shared__ __align__(16) std::uint8_t
-      r3_stage[(D == 256 && !kGlobal && kQ8) ? 2 * kKeys * 272 : 1];
+  // from it. R3-E2: the global D=512 q8 instantiation reuses the
+  // buffer one quarter-tile at a time (the global tiles, scores
+  // and probabilities already stage ~61 KB of the 64 KB LDS
+  // budget, so a full 10,880 B tile staging does not fit):
+  // 4 keys x 544 B V rows, then 4 keys x 136 B rotated-K rows,
+  // 2720 bytes total, filled by stage_quarter() and consumed by
+  // fetch_global_q8(). One byte in every other instantiation.
+  __shared__ __align__(16)
+      std::uint8_t r3_stage[(D == 256 && !kGlobal && kQ8)  ? 2 * kKeys * 272
+                            : (D == 512 && kGlobal && kQ8) ? 2720
+                                                           : 1];
   __shared__ float row_scale[kRowBlocks][16];
   __shared__ float row_sum[kRowBlocks][16];
 
@@ -501,6 +509,127 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
     }
   };
 
+  // R3-E2: quarter-tile staging for the global D=512 q8_0
+  // reproduction (see the r3_stage declaration for why quarters:
+  // the LDS budget). One wave per key of the quarter, lane
+  // holding dims 32 b + lane (b < 16), reproducing
+  // QkvPostKernel<512> exactly: the norm sum pairs b and b + 8
+  // per lane and WaveSums in w order, as QkvPost's (w, k) loops
+  // accumulate it; K gets k_norm then NEOX rope at the key's own
+  // position (pairs b, b + 8); the V row quantizes plain via
+  // StoreQ8PlainBlocks' arithmetic (block b = dims [32 b, +32));
+  // the rotated-K row quantizes blocks b in {0, 1, 8, 9} into
+  // packed blocks {0, 1, 2, 3} (the KV-09 store). Raw
+  // unquantized values are never staged; the cache write stays
+  // exactly as before. A barrier closes the step.
+  constexpr std::uint32_t kR3VRowQ8 = 544;    // 512 codes + 16 scales
+  constexpr std::uint32_t kR3RotRowQ8 = 136;  // 128 codes + 4 scales
+  const auto stage_quarter = [&](std::uint32_t key0, std::uint32_t qq) {
+    if constexpr (D == 512 && kGlobal && kQ8) {
+      if (a.current.k != nullptr) {
+        const std::uint32_t wave_id = tid >> 5U;
+        const std::size_t kv_row =
+            a.current.row_stride != 0
+                ? a.current.row_stride
+                : static_cast<std::size_t>(a.kv_heads) * D;
+        const std::size_t v_row =
+            a.current.v_stride != 0 ? a.current.v_stride
+                                    : static_cast<std::size_t>(a.kv_heads) * D;
+        for (std::uint32_t klq = wave_id; klq < 4; klq += kThreads / 32) {
+          const std::uint32_t key = key0 + 4 * qq + klq;
+          if (!is_current(key)) {
+            continue;
+          }
+          const std::size_t local =
+              static_cast<std::size_t>(key - a.current.first_position);
+          const float* ksrc = a.current.k + local * kv_row +
+                              static_cast<std::size_t>(kv_head) * D;
+          const float* vsrc = a.current.v + local * v_row +
+                              static_cast<std::size_t>(kv_head) * D;
+          {  // V row: norm (no weight, no rope), plain quantize.
+            float v[16];
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+              v[b] = vsrc[32 * b + lane];
+            }
+            float total = 0.0F;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+              total += R3WaveSum(v[w] * v[w] + v[w + 8] * v[w + 8]);
+            }
+            const float r =
+                rsqrtf(total / static_cast<float>(D) + a.current.eps);
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+              v[b] = v[b] * r;
+            }
+            std::uint8_t* rowp = r3_stage + klq * kR3VRowQ8;
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+              const float amax = R3WaveMax(fabsf(v[b]));
+              const float dscale = amax / 127.0F;
+              const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
+              rowp[b * 32 + lane] = static_cast<std::uint8_t>(
+                  static_cast<std::int8_t>(roundf(v[b] * inv)));
+              if (lane == 0) {
+                *reinterpret_cast<__half*>(rowp + 512 + b * 2) =
+                    __float2half(dscale);
+              }
+            }
+          }
+          {  // K row: norm with k_norm, NEOX rope, rotated quantize.
+            float v[16];
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+              v[b] = ksrc[32 * b + lane];
+            }
+            float total = 0.0F;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+              total += R3WaveSum(v[w] * v[w] + v[w + 8] * v[w + 8]);
+            }
+            const float r =
+                rsqrtf(total / static_cast<float>(D) + a.current.eps);
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+              const float x = v[b] * r;
+              v[b] = a.current.k_norm != nullptr
+                         ? x * a.current.k_norm[32 * b + lane]
+                         : x;
+            }
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+              const std::uint32_t d = 32 * b + lane;
+              const float theta = R3RopeAngle(key, d, a.current.theta_scale,
+                                              a.current.freq_factors);
+              const float c = __ocml_cos_f32(theta);
+              const float sn = __ocml_sin_f32(theta);
+              const float lo = v[b];
+              const float hi = v[b + 8];
+              v[b] = lo * c - hi * sn;
+              v[b + 8] = lo * sn + hi * c;
+            }
+            std::uint8_t* rowp = r3_stage + 4 * kR3VRowQ8 + klq * kR3RotRowQ8;
+            constexpr int kRotB[4] = {0, 1, 8, 9};
+#pragma unroll
+            for (int pb = 0; pb < 4; ++pb) {
+              const float amax = R3WaveMax(fabsf(v[kRotB[pb]]));
+              const float dscale = amax / 127.0F;
+              const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
+              rowp[pb * 32 + lane] = static_cast<std::uint8_t>(
+                  static_cast<std::int8_t>(roundf(v[kRotB[pb]] * inv)));
+              if (lane == 0) {
+                *reinterpret_cast<__half*>(rowp + 128 + pb * 2) =
+                    __float2half(dscale);
+              }
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
+  };
+
   // Each thread stages kStage 8-half chunks of K and V per tile; the next
   // tile's chunks are loaded into registers while the current one computes.
   constexpr std::uint32_t kChunks = kKeys * (D / 8);
@@ -561,7 +690,161 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   const std::uint32_t rot_offset =
       (tid % kKeys) * rot_row_bytes + (tid / kKeys) * 8 * 2;
   uint4 k_rot;
+  // R3-E2: fetch for global D=512 q8_0 with a current chunk.
+  // Per quarter: stage_quarter() fills r3_stage, then this
+  // thread's chunks load from the staging for current keys and
+  // from the cache otherwise -- the fused full-block (V) /
+  // half-block (rotated K) loaders on full tiles, the per-chunk
+  // road on partial tiles, both with DequantQ8Packed /
+  // DequantQ8Chunk arithmetic, so the staged tile is bit-for-bit
+  // the bypass tile. The fused loaders' __shfl distributions run
+  // unconditionally every quarter (a staged slot outside this
+  // quarter clamps to row 0 of the quarter); only the register
+  // assignment is quarter-conditional. A barrier closes each
+  // quarter before the next staging overwrites r3_stage.
+  const auto fetch_global_q8 = [&](std::uint32_t key0) {
+    if constexpr (D == 512 && kGlobal && kQ8) {
+      v_next[0] = make_uint4(0U, 0U, 0U, 0U);
+      v_next[1] = make_uint4(0U, 0U, 0U, 0U);
+      k_rot = make_uint4(0U, 0U, 0U, 0U);
+      const bool full = key0 + kKeys <= block_hi;
+      const auto pack2 = [](std::uint32_t lo, std::uint32_t hi) {
+        return static_cast<std::uint64_t>(lo) |
+               (static_cast<std::uint64_t>(hi) << 32);
+      };
+      const std::uint32_t pair = tid % 8;
+      const std::uint32_t key_a = key0 + chunk_key(0);
+      const std::uint32_t d8v = chunk_d8(0);
+      for (std::uint32_t qq = 0; qq < 4; ++qq) {
+        stage_quarter(key0, qq);
+        const bool my_v = pair / 2 == qq;
+        if (full) {
+          const std::uint32_t blk = d8v / 32;
+          const std::uint32_t q = (tid / 8) % 4;
+          const int src = static_cast<int>(tid - q * 8);
+          std::uint32_t wa[8] = {};
+          std::uint32_t wb[8] = {};
+          std::uint32_t sa = 0;
+          std::uint32_t sb = 0;
+          if (q == 0) {
+            const std::uint32_t sla = key_a - key0 - 4 * qq;
+            const std::uint32_t slb = key_a + 1 - key0 - 4 * qq;
+            if (is_current(key_a)) {
+              LoadQ8BlockRaw(r3_stage, kR3VRowQ8, sla < 4 ? sla : 0, 0, D, blk,
+                             wa, &sa);
+            } else {
+              LoadQ8BlockRaw(a.v_cache_q8, row_bytes_q8, key_a, kv_head, D, blk,
+                             wa, &sa);
+            }
+            if (is_current(key_a + 1)) {
+              LoadQ8BlockRaw(r3_stage, kR3VRowQ8, slb < 4 ? slb : 0, 0, D, blk,
+                             wb, &sb);
+            } else {
+              LoadQ8BlockRaw(a.v_cache_q8, row_bytes_q8, key_a + 1, kv_head, D,
+                             blk, wb, &sb);
+            }
+          }
+#pragma unroll
+          for (int w = 0; w < 8; ++w) {
+            wa[w] = static_cast<std::uint32_t>(
+                __shfl(static_cast<int>(wa[w]), src));
+            wb[w] = static_cast<std::uint32_t>(
+                __shfl(static_cast<int>(wb[w]), src));
+          }
+          sa = static_cast<std::uint32_t>(__shfl(static_cast<int>(sa), src));
+          sb = static_cast<std::uint32_t>(__shfl(static_cast<int>(sb), src));
+          std::uint64_t packed_a = 0;
+          std::uint64_t packed_b = 0;
+#pragma unroll
+          for (std::uint32_t c = 0; c < 4; ++c) {
+            if (q == c) {
+              packed_a = pack2(wa[2 * c], wa[2 * c + 1]);
+              packed_b = pack2(wb[2 * c], wb[2 * c + 1]);
+            }
+          }
+          const std::uint16_t sab = static_cast<std::uint16_t>(sa);
+          const std::uint16_t sbb = static_cast<std::uint16_t>(sb);
+          __half scale_a;
+          __half scale_b;
+          __builtin_memcpy(&scale_a, &sab, sizeof(sab));
+          __builtin_memcpy(&scale_b, &sbb, sizeof(sbb));
+          if (my_v) {
+            v_next[0] = DequantQ8Packed(packed_a, scale_a);
+            v_next[1] = DequantQ8Packed(packed_b, scale_b);
+          }
+        } else if (my_v) {
+#pragma unroll
+          for (std::uint32_t j = 0; j < 2; ++j) {
+            const std::uint32_t position = key0 + chunk_key(j);
+            if (position < block_hi) {
+              v_next[j] =
+                  is_current(position)
+                      ? DequantQ8Chunk(r3_stage, kR3VRowQ8,
+                                       position - key0 - 4 * qq, 0, D, d8v)
+                      : DequantQ8Chunk(a.v_cache_q8, row_bytes_q8, position,
+                                       kv_head, D, d8v);
+            }
+          }
+        }
+        if (rot_wave) {
+          const std::uint32_t rkey = key0 + tid % kKeys;
+          const std::uint32_t rd8 = (tid / kKeys) * 8;
+          const bool my_r = (tid % kKeys) / 4 == qq;
+          if (full) {
+            const bool rloader = lane < 16U;
+            const int rsrc = static_cast<int>(rloader ? lane : lane - 16U);
+            std::uint32_t rw[4] = {};
+            std::uint32_t rsb = 0;
+            if (rloader) {
+              const std::uint32_t slr = tid % kKeys - 4 * qq;
+              if (is_current(rkey)) {
+                LoadQ8HalfBlockRaw(r3_stage + 4 * kR3VRowQ8, kR3RotRowQ8,
+                                   slr < 4 ? slr : 0, 0, 2 * kGlobalPairs, rd8,
+                                   rw, &rsb);
+              } else {
+                LoadQ8HalfBlockRaw(a.k_cache_q8, rot_row_bytes_q8, rkey,
+                                   kv_head, 2 * kGlobalPairs, rd8, rw, &rsb);
+              }
+            }
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+              rw[w] = static_cast<std::uint32_t>(
+                  __shfl(static_cast<int>(rw[w]), rsrc));
+            }
+            rsb =
+                static_cast<std::uint32_t>(__shfl(static_cast<int>(rsb), rsrc));
+            const std::uint64_t rpacked =
+                rloader ? pack2(rw[0], rw[1]) : pack2(rw[2], rw[3]);
+            const std::uint16_t rs16 = static_cast<std::uint16_t>(rsb);
+            __half rscale;
+            __builtin_memcpy(&rscale, &rs16, sizeof(rs16));
+            if (my_r) {
+              k_rot = DequantQ8Packed(rpacked, rscale);
+            }
+          } else if (my_r && rkey < block_hi) {
+            k_rot = is_current(rkey)
+                        ? DequantQ8Chunk(r3_stage + 4 * kR3VRowQ8, kR3RotRowQ8,
+                                         tid % kKeys - 4 * qq, 0,
+                                         2 * kGlobalPairs, rd8)
+                        : DequantQ8Chunk(a.k_cache_q8, rot_row_bytes_q8, rkey,
+                                         kv_head, 2 * kGlobalPairs, rd8);
+          }
+        }
+        __syncthreads();
+      }
+    }
+  };
   const auto fetch = [&](std::uint32_t key0) {
+    if constexpr (kGlobal && kQ8) {
+      // R3-E2: a current chunk is reproduced into LDS staging
+      // quarter by quarter and read from there (fetch_global_q8);
+      // the cache roads below are the bypass this is proven
+      // bit-identical against.
+      if (a.current.k != nullptr) {
+        fetch_global_q8(key0);
+        return;
+      }
+    }
     if constexpr (kGlobal) {
       if (key0 + kKeys <= block_hi) {
         if constexpr (kQ8) {

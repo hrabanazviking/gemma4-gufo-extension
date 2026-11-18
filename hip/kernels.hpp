@@ -202,7 +202,9 @@ struct AttentionArgs {
   /// R3-E1: current-chunk descriptor (see CurrentChunkArgs);
   /// populated by the executor for prefill segments; consumed by
   /// the WMMA prefill kernel's LDS-staged reproduction for
-  /// sliding D=256 q8_0 layers (part 2), ignored elsewhere.
+  /// sliding D=256 q8_0 layers (part 2) and, since R3-E2, for
+  /// global D=512 q8_0 layers (quarter-tile staging), ignored
+  /// elsewhere.
   CurrentChunkArgs current{};
   /// Decode widths: the output rows also fill this WMMA activation pack
   /// (width heads * head_dim) as its rows pack_row0 + r.
