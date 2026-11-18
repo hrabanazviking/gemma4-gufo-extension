@@ -78,6 +78,7 @@ if(TARGET gufo_gemma4_hip)
   gufo_extension_hip_sources(gufo_gemma4_hip
     SOURCES
       hip/attention_wmma.hip.cpp
+      hip/qkv_post.hip.cpp
       hip/gemv.hip.cpp
       hip/moe.hip.cpp
       hip/wmma_gemv.hip.cpp
