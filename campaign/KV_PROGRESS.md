@@ -2433,3 +2433,39 @@ reports the active format; f16 is the production default,
 q8_0 a proven opt-in. Slices banked: 13 of 16
 (KV-01..KV-11, KV-13, KV-14). Next: KV-15 (resident service
 end-to-end re-proof).
+
+## Phase 7 second slice (KV-15) -- resident service e2e re-proof, q8_0 active
+
+Keeper tick 2026-11-18 02:22-02:24 EST, purpleraider; MemAvailable
+~124 GiB throughout (above the 40 GiB floor); Ollama :11434
+untouched (answered 0.40.16 throughout); thermal-throttle code
+and config untouched, no thermal/throttle lines in the journal.
+
+- Resting, q8_0: drop-in 10-kv-cache.conf
+  (GUFO_KV_CACHE_TYPE=q8_0), daemon-reload, restart.
+  /api/version kv_cache_type q8_0; /api/ps empty (resting);
+  /api/tags reports q8_0 per model.
+- Malformed manners, before any load: invalid JSON body ->
+  HTTP 400 {error: request body is not valid JSON}; unknown
+  model -> HTTP 404 with the named not-found error; service
+  stayed active, /api/ps still empty.
+- First-call load: chat probe (capital of France, one word)
+  loaded in ~4.7 s wall and answered Paris. While loaded,
+  /api/ps reported kv_cache_type q8_0 on the model entry.
+- keep_alive rules: a keep_alive 5m call set expires_at ~20 min
+  out (the supervisor idle window governs expiry, recorded as
+  observed); a keep_alive 0 call answered and unloaded --
+  /api/ps empty within 2 s. Idle unload itself is the same
+  expires_at mechanism; the full 20-min wait was not re-run
+  this tick.
+- Restore: drop-in removed, daemon-reload, restart --
+  /api/version f16, /api/ps empty, service active and resting
+  with the f16 default (Decision 3).
+
+**Phase 7 gate: PASSED** 2026-11-18 -- with q8_0 active the
+resident service behaves as before (resting, first-call load,
+keep_alive unload, clean malformed-request errors) except the
+cache format, which its meta surface reports as q8_0. Slices
+banked: 14 of 16 (KV-01..KV-11, KV-13, KV-14, KV-15). Next:
+KV-16 (Phase 8 soak, final table, close-out; Decision 3 is the
+default decision).
