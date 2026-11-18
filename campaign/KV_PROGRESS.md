@@ -1846,3 +1846,41 @@ removed before the banking commit, so no lock remains at
 tick end. Banked files: the two harness files above plus
 this ledger; the untracked results/ dirs are untouched and
 uncommitted, as ordered.
+
+## Phase 5 REDO R7 round 5 -- R6 EXHAUSTED, BLOCKER: executor-level redesign needs Volmarr's word (2026-11-17, keeper tick 19:14 EST)
+
+State verified this tick: local HEAD 5ffccab equals the fork
+remote head (ls-remote verified), no build lock, no live
+build/bench process, MemAvailable about 124 GiB (well above
+the 40 GiB floor). Ollama :11434 and gufo-resident.service
+untouched. Phase 6 (KV-13) does NOT start. No quantized mode
+becomes any default.
+
+Where the redo stands, from banked evidence only:
+- R1 + R2 (global and sliding) + R4 rotated-K fusion banked;
+  the R5 gate re-run on that state FAILED the raised bar
+  (pp512 -1.36, pp4096 -7.06, pp16384 -4.56 pct vs same-binary
+  f16; probes byte-identical, host test PASS).
+- R7 round 3 (A) int8-resident K tile: implemented, slower,
+  reverted in round 4 to the R4 staged road, byte-identical.
+- R6 E1 fused-V scale-folding: disqualified by design, no
+  bit-identical variant exists.
+- R6 E2 int8-WMMA QK spike: variant B beats the bf16 proxy
+  1.15x / 1.09x but byte identity fails as predicted and
+  variant C loses; measurement only, nothing ships.
+
+Conclusion: every bounded mechanism in the redo plan has now
+been tried or disqualified, and the Phase 5 gate remains
+FAILED on the raised bar. The only remaining documented
+road is the executor-level R3 redesign (fuse QkvPost into
+the prefill attention kernel, or the full plumbing plus
+duplicated norm/rope/quantize recorded in the R3 audit),
+which the R3 audit and the R5 verdict both record as
+needing Volmarr's word before it starts. That word is the
+blocker for this tick: no new builder round is started
+without it, and no gate is fudged or quietly passed.
+
+Question for Volmarr, plainly: approve the executor-level
+R3 redesign as the next Phase 5 round, or close Phase 5
+with q8_0 prefill staying on the proven KV-11 non-WMMA road
+and the gate recorded as failed on the raised bar?
