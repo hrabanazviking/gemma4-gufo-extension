@@ -2058,6 +2058,9 @@ BlockShape ShapeOf(const Config& c, std::uint32_t n) {
 }
 
 /// Byte offsets of each layer's K and V rows inside a block of its kind.
+/// KV-13: rows are sized in the cache's stored format (KvCacheRowBytes),
+/// so a q8_0 session's snapshot blocks hold the exact stored bytes of
+/// each row, as the binary16 blocks always did.
 struct BlockLayout {
   std::vector<std::uint64_t> k_at;
   std::vector<std::uint64_t> v_at;
@@ -2066,15 +2069,19 @@ struct BlockLayout {
 };
 
 BlockLayout LayoutOf(const Config& c,
-                     const std::vector<std::uint32_t>& key_widths) {
+                     const std::vector<std::uint32_t>& key_widths,
+                     KvCacheFormat format) {
   BlockLayout layout;
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
     const bool sliding = c.IsSliding(l);
+    const KvCacheFormat layer = KvCacheLayerFormat(format, sliding);
     std::uint64_t& bytes = sliding ? layout.sliding_bytes : layout.global_bytes;
     layout.k_at.push_back(bytes);
-    bytes += std::uint64_t{BlockRows(sliding)} * key_widths[l] * 2;
+    bytes += std::uint64_t{BlockRows(sliding)} *
+             KvCacheRowBytes(key_widths[l], layer);
     layout.v_at.push_back(bytes);
-    bytes += std::uint64_t{BlockRows(sliding)} * c.KvDim(l) * 2;
+    bytes +=
+        std::uint64_t{BlockRows(sliding)} * KvCacheRowBytes(c.KvDim(l), layer);
   }
   return layout;
 }
@@ -2101,7 +2108,8 @@ template<typename Visit>
 std::uint64_t VisitBody(const Config& c,
                         const std::vector<std::uint32_t>& key_widths,
                         const BlockLayout& layout, const BlockShape& s,
-                        std::uint32_t ring, const Visit& visit) {
+                        std::uint32_t ring, KvCacheFormat format,
+                        const Visit& visit) {
   std::uint64_t rest = 0;
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
     const bool sliding = c.IsSliding(l);
@@ -2112,7 +2120,8 @@ std::uint64_t VisitBody(const Config& c,
         (sliding ? s.sliding_end : s.global) * block_rows;
     for (const bool values : {false, true}) {
       const std::uint64_t row =
-          std::uint64_t{values ? c.KvDim(l) : key_widths[l]} * 2;
+          KvCacheRowBytes(values ? c.KvDim(l) : key_widths[l],
+                          KvCacheLayerFormat(format, sliding));
       for (std::uint32_t p = sliding ? s.live : 0; p < s.n;) {
         BodyRun run{l, values, p, 0, row, kRest, rest};
         std::uint32_t end = s.n;
@@ -2284,9 +2293,12 @@ std::uint64_t Session::SnapshotBytes() const {
   std::uint64_t bytes = sizeof(SnapshotHeader) + std::uint64_t{n} * 4 + 4 +
                         images_.size() * kImageRecordBytes;
   const auto& key_widths = model_->executor_->key_widths();
+  const KvCacheFormat format = cache_->format;
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
+    const KvCacheFormat layer = KvCacheLayerFormat(format, c.IsSliding(l));
     bytes += std::uint64_t{n - FirstLiveRow(c, l, n)} *
-             (key_widths[l] + c.KvDim(l)) * 2;
+             (KvCacheRowBytes(key_widths[l], layer) +
+              KvCacheRowBytes(c.KvDim(l), layer));
   }
   return bytes + std::uint64_t{c.hidden_size} * 4 +
          std::uint64_t{model_->VocabSize()} * 4;
@@ -2329,7 +2341,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
 
   auto& executor = *model_->executor_;
   const auto& key_widths = executor.key_widths();
-  const BlockLayout layout = LayoutOf(c, key_widths);
+  const BlockLayout layout = LayoutOf(c, key_widths, cache_->format);
   const BlockShape shape = ShapeOf(c, n);
   const std::uint32_t ring = cache_->ring;
   // Planning and allocation touch only this session's state, so other
@@ -2339,6 +2351,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
   // Blocks the cache still holds are shared; the others are copied, each
   // kind's new blocks into one allocation.
   snapshot->sliding_first_ = shape.sliding_first;
+  snapshot->format_ = cache_->format;
   std::vector<bool> fresh_global(shape.global);
   std::vector<bool> fresh_sliding(shape.sliding_end - shape.sliding_first);
   const auto gather =
@@ -2374,7 +2387,8 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
       };
   const std::uint64_t hidden_bytes = std::uint64_t{c.hidden_size} * 4;
   const std::uint64_t rest_bytes =
-      VisitBody(c, key_widths, layout, shape, ring, [](const BodyRun&) {});
+      VisitBody(c, key_widths, layout, shape, ring, cache_->format,
+                [](const BodyRun&) {});
   const auto rest = memory.Allocate(rest_bytes + hidden_bytes);
   if (rest == nullptr ||
       !gather(snapshot->global_, 0, fresh_global, held_global_,
@@ -2395,29 +2409,33 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     }
     snapshot->body_bytes_ += bytes;
   };
-  VisitBody(c, key_widths, layout, shape, ring, [&](const BodyRun& r) {
-    const bool sliding = c.IsSliding(r.layer);
-    std::uint8_t* to = rest.get() + r.offset;
-    bool copy = true;
-    if (r.block != kRest) {
-      const std::size_t i = sliding ? r.block - shape.sliding_first : r.block;
-      const auto& blocks = sliding ? snapshot->sliding_ : snapshot->global_;
-      // Fresh blocks are written here, before any other snapshot shares them.
-      to = const_cast<std::uint8_t*>(blocks[i].get()) + r.offset;
-      copy = sliding ? fresh_sliding[i] : fresh_global[i];
-    }
-    const std::uint64_t bytes = std::uint64_t{r.rows} * r.row_bytes;
-    if (copy) {
-      const std::uint16_t* cache =
-          r.values ? cache_->v[r.layer] : cache_->k[r.layer];
-      const std::uint32_t slot = sliding ? r.first % ring : r.first;
-      AddRun(runs,
-             reinterpret_cast<const std::uint8_t*>(cache) +
-                 std::uint64_t{slot} * r.row_bytes,
-             to, bytes);
-    }
-    add_piece(to, bytes);
-  });
+  VisitBody(c, key_widths, layout, shape, ring, cache_->format,
+            [&](const BodyRun& r) {
+              const bool sliding = c.IsSliding(r.layer);
+              std::uint8_t* to = rest.get() + r.offset;
+              bool copy = true;
+              if (r.block != kRest) {
+                const std::size_t i =
+                    sliding ? r.block - shape.sliding_first : r.block;
+                const auto& blocks =
+                    sliding ? snapshot->sliding_ : snapshot->global_;
+                // Fresh blocks are written here, before any other snapshot
+                // shares them.
+                to = const_cast<std::uint8_t*>(blocks[i].get()) + r.offset;
+                copy = sliding ? fresh_sliding[i] : fresh_global[i];
+              }
+              const std::uint64_t bytes = std::uint64_t{r.rows} * r.row_bytes;
+              if (copy) {
+                const std::uint16_t* cache =
+                    r.values ? cache_->v[r.layer] : cache_->k[r.layer];
+                const std::uint32_t slot = sliding ? r.first % ring : r.first;
+                AddRun(runs,
+                       reinterpret_cast<const std::uint8_t*>(cache) +
+                           std::uint64_t{slot} * r.row_bytes,
+                       to, bytes);
+              }
+              add_piece(to, bytes);
+            });
   std::uint8_t* hidden = rest.get() + rest_bytes;
   AddRun(runs, cache_->hidden, hidden, hidden_bytes);
   add_piece(hidden, hidden_bytes);
@@ -2498,6 +2516,10 @@ std::size_t Session::ReadHead(std::span<const std::uint8_t> head,
 
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
+  if (snapshot.format_ != cache_->format) {
+    return Fail(error_msg,
+                "snapshot cache format does not match the session cache");
+  }
   const std::size_t head_bytes =
       ReadHead(snapshot.head_, snapshot.SizeBytes(), error_msg);
   if (head_bytes == 0) {
@@ -2515,7 +2537,7 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
   }
   auto& executor = *model_->executor_;
   const auto& key_widths = executor.key_widths();
-  const BlockLayout layout = LayoutOf(c, key_widths);
+  const BlockLayout layout = LayoutOf(c, key_widths, cache_->format);
   const std::uint32_t ring = cache_->ring;
   SettleHeld();
   // Blocks the cache still holds keep their rows.
@@ -2529,8 +2551,9 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
            held_global_[i].lock() == snapshot.global_[i];
   };
   std::vector<rocm::CopyRun> runs;
-  const std::uint64_t rest_bytes =
-      VisitBody(c, key_widths, layout, shape, ring, [&](const BodyRun& r) {
+  const std::uint64_t rest_bytes = VisitBody(
+      c, key_widths, layout, shape, ring, cache_->format,
+      [&](const BodyRun& r) {
         const bool sliding = c.IsSliding(r.layer);
         const std::uint8_t* from = snapshot.rest_.get() + r.offset;
         if (r.block != kRest) {
@@ -2586,7 +2609,8 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   held_sliding_.clear();
   const auto copy_rows = [&](std::uint16_t* cache, std::uint32_t layer,
                              std::uint32_t first, std::uint32_t width) {
-    const std::size_t row = std::size_t{width} * 2;
+    const std::size_t row = KvCacheRowBytes(
+        width, KvCacheLayerFormat(cache_->format, c.IsSliding(layer)));
     const bool ring = c.IsSliding(layer);
     for (std::uint32_t p = first; p < n;) {
       const std::uint32_t slot = ring ? p % cache_->ring : p;

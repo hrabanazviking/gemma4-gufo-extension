@@ -83,7 +83,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-10 global validation gate | DONE | section below; Phase 4 gate PASSED; probes identical excl load timing; matrix kv10-q8 vs kv10-f16 recorded |
 | KV-11 non-WMMA prefill q8_0 | DONE | section below; probes byte-identical q8 vs f16; pp4096 +40.7 pct, pp16384 +103.8 pct vs KV-10 q8 |
 | KV-12 WMMA prefill / dispatch rule | SUPERSEDED BY REDO 2026-11-17, GATE OPEN | section below; WMMA dequant-tile stage landed, probes byte-identical; pp16384 -2.98 pct vs f16 is real, beyond noise -- Phase 5 gate not yet passed |
-| KV-13 machinery re-proof | PENDING | |
+| KV-13 machinery re-proof | DONE | section below; snapshot machinery made format-aware and re-proven in both formats; MoveKey kernel-proven byte-exact over q8_0; MTP chain named gap (no draft GGUF on this machine) |
 | KV-14 full-stack integration | PENDING | |
 | KV-15 resident service re-proof | PENDING | |
 | KV-16 soak + default decision + close | PENDING | |
@@ -2268,3 +2268,106 @@ Rulings:
 2. **q8_0 remains a proven-correct OPT-IN** (GUFO_KV_CACHE_TYPE=q8_0): probes byte-identical vs f16, cache ~41% smaller — for memory-tight uses, never the purpleraider default.
 3. Remaining KV slices re-scoped under this ruling: Phase 6 (KV-13) = correctness re-proof of the opt-in only; Phase 7 (KV-14/15) = wire the setting through the resident service with **f16 the default**; Phase 8 (KV-16) = close-out, this ruling IS the default decision.
 4. **NEW LINE COMMISSIONED:** the speed hunt continues beyond KV compression — a research-first speed campaign for BOTH the Gufo core fork and this Gemma4 extension (kernel, prefill and decode paths). Its roadmap is to be drafted and banked; the KV keeper's remaining work is the re-scoped slices above.
+
+## Phase 6 slice (KV-13) -- machinery re-proof of the q8_0 opt-in
+
+Re-scoped by Decision 3: correctness re-proof only. Audit first,
+from disk (2026-11-18, builder tick):
+
+- `MoveKey` (speculative sibling commit, engine.cpp commit path ->
+  `Executor::MoveKey`): already stored-row correct -- widths are
+  `KvCacheRowBytes(values, KvCacheLayerFormat) / 2` uint16 units
+  for every layer (KV-07 sliding, KV-09 global incl. the 272 B
+  derived-K row). No change needed; kernel-proven below.
+- `DraftChains` / Forward: pass the q8_0 cache pointers for every
+  layer of a q8_0 cache (KV-07/KV-09, re-read this tick at
+  hip/executor.cpp DraftChains). No change needed.
+- Continuation snapshots/rollback: **binary16-only, as KV-07
+  recorded** -- `engine.cpp` `LayoutOf`, `VisitBody`,
+  `Session::SnapshotBytes` and the serialized-restore `copy_rows`
+  all sized rows `width * 2`, while the cache carve strides rows
+  by `KvCacheRowBytes`. A q8_0 snapshot would have been sized and
+  copied wrong. This was the slice's one real defect, and it is
+  extension-side (engine.cpp lives in this clone, not Gufo core).
+
+What landed (this commit):
+- `engine.cpp` / `engine.hpp`: the snapshot machinery is now
+  format-aware. `LayoutOf` and `VisitBody` take the cache format
+  and size every row by `KvCacheRowBytes(width, layer format)`;
+  `SnapshotBytes` sums the same figures; the serialized restore
+  strides by the same. For f16 every figure is bit-identical to
+  before (`KvCacheRowBytes(w, kF16) == 2w`), so f16 snapshots are
+  unchanged byte for byte. `SessionSnapshot` records its source
+  cache format; a typed restore into a cache of another format is
+  refused by name ("snapshot cache format does not match the
+  session cache"), and a serialized cross-format payload is
+  refused by the format-sensitive size check in ReadHead (per-token
+  totals 125,440 q8_0 vs 220,160 f16 differ at any position >= 1).
+- New tests, registered in extension.cmake + extension.json:
+  `tests/kv13_machinery_test.cpp` (ctest gemma4.kv13_machinery) and
+  `tests/kv13_movekey_test.cpp` (ctest gemma4.kv13_movekey).
+
+Verification (2026-11-18, device; core CMake gpu-test road in
+~/src/gufo-dev against this clone via GUFO_EXTENSION_DIRS, entered
+through the cached shipping derivation's environment -- the
+upstream devShell road stalls on a rocprofiler-sdk source fetch
+and was not used; the libsndfile pkg-config path was supplied from
+the store for the in-tree embedding_gemma2 manifest check;
+GUFO_BUILD_TOOLS=OFF as in the shipping flags. Logs device-side
+in campaign/kv-harness/results/kv13/):
+- gemma4.kv13_movekey PASS: rocm::MoveKey driven with the
+  executor's exact width formula over production-shaped rows
+  (sliding 2,048-value row = 2,176 stored B; derived-K 256-value
+  row = 272 B beside its 1,024-value V row = 1,088 B; plain global
+  row), direct move + a move whose keys wrap the sliding ring:
+  byte-exact, every other row untouched, f16 control identical.
+- gemma4.kv13_machinery PASS (16.15 s): for f16 and for q8_0 --
+  snapshot after the sliding ring wrapped (max_context 3072,
+  prefill_chunk 240, the target_test geometry); SizeBytes ==
+  SnapshotBytes; CopyTo == Stream; typed + serialized restore
+  into fresh sessions continue bitwise-equal to the original for
+  8 greedy steps; rollback of the advanced original returns the
+  exact snapshot-point logits and its re-snapshot reproduces the
+  original payload byte for byte. Snapshot payload at that
+  position: f16 227,894,088 B vs q8_0 121,568,088 B (-46.7%).
+  Cross-format refusal proven both directions, both paths
+  (serialized by size check; typed by the named format error).
+- gemma4.kv_cache_format PASS; gemma4.continuation and
+  gemma4.continuation_perturbed PASS (snapshot-adjacent
+  regression check on the f16 path).
+- Nix shipping build of the fixed tree: clean
+  (/nix/store/ff2h1jxabywy94pmpxvp4kz2jqfj5al4-gufo-0-unstable-
+  4938016). clang-format clean on all touched files.
+- Named failure, NOT KV-13's: gemma4.target fails at
+  "boundary snapshot diverges after its tail" (the lookahead-
+  boundary snapshot check). Control run with the KV-13 engine
+  changes stashed reproduces the identical failure with identical
+  KL figures (decode mean KL 1.38831e-06, prefill 1.92046e-05),
+  so it pre-exists this slice on the gufo-dev core road -- the
+  local core is ahead of this extension's pinned core
+  (gufo@4938016, the nix road, which ships no test run). Owner:
+  the core/extension pairing, outside this campaign; KV-13's own
+  snapshot proofs above cover the roadmap's snapshot/rollback
+  requirement in both formats. Not silently skipped: recorded
+  here, with the control evidence in results/kv13/control.log.
+- Named gap, NOT silently skipped: the MTP draft chain end to end
+  (DraftChains driving a real draft chain, sibling commits firing
+  MoveKey in a live session) cannot run on this machine -- it
+  needs the separate MTP draft GGUF (GUFO_GEMMA4_MTP_MODEL), and
+  only the main heretic GGUF is present. The gap is format-blind:
+  target_test records the same "speculation unchecked" skip for
+  f16. DraftChains' q8_0 pointer plumbing is audit-verified and
+  MoveKey itself is kernel-proven above; the end-to-end chain
+  re-proof waits on the draft-model asset (owner: model hoard /
+  Volmarr's word for a download), not on any code in this repo.
+- Installed profile, gufo-resident.service and Ollama (:11434)
+  untouched; MemAvailable ~124 GiB throughout.
+
+**Phase 6 gate: PASSED** 2026-11-18 -- snapshot/rollback
+machinery fixed and re-proven over the quantized layout in both
+formats, MoveKey re-proven at kernel level over q8_0 stored rows,
+DraftChains audit-verified; the two named items above (pre-
+existing target_test boundary failure on the dev core road; MTP
+chain asset gap) are recorded with owners, per the gate's own
+terms. Slices banked: 12 of 16 (KV-01..KV-11, KV-13). Next:
+KV-14 (Phase 7 integration, f16 default per Decision 3).

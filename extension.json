@@ -91,6 +91,8 @@
     "gemma4_continuation_test":       {"requires": ["hip", "testing"], "role": "test"},
     "gemma4_vision_encoder_test":     {"requires": ["hip", "testing"], "role": "test"},
     "gemma4_vision_session_test":     {"requires": ["hip", "testing"], "role": "test"},
+    "gemma4_kv13_movekey_test":       {"requires": ["hip", "testing"], "role": "test"},
+    "gemma4_kv13_machinery_test":     {"requires": ["hip", "testing"], "role": "test"},
     "gemma4_draft_replay":            {"requires": ["testing"], "role": "test"},
     "gemma4_reference_probe":         {"requires": ["testing"], "role": "test"},
     "gemma4_vision_probe":            {"requires": ["testing"], "role": "test"},

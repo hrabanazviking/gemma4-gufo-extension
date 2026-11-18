@@ -131,6 +131,11 @@ private:
   std::vector<std::shared_ptr<const std::uint8_t>> global_;
   std::vector<std::shared_ptr<const std::uint8_t>> sliding_;
   std::uint32_t sliding_first_{0};
+  /// KV storage format of the cache this snapshot was taken from
+  /// (KV-13): a typed restore into a cache of another format is
+  /// refused by name; serialized payloads are refused by the
+  /// format-sensitive size check in ReadHead.
+  KvCacheFormat format_{KvCacheFormat::kF16};
   /// Device: the rows outside those blocks, then the hidden state.
   std::shared_ptr<const std::uint8_t> rest_;
   std::vector<Piece> body_;

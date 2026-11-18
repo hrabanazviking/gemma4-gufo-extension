@@ -228,6 +228,12 @@ _gemma4_test(vision_encoder "hip;gpu;gfx1151;vision;external-model" MODEL
 _gemma4_test(vision_session "hip;gpu;gfx1151;vision;external-model;slow" MODEL
   SOURCES tests/vision_session_test.cpp
   LINK_LIBRARIES gufo_gemma4_hip gufo_gemma4 gufo_ext_hip)
+_gemma4_test(kv13_movekey "hip;gpu;gfx1151"
+  SOURCES tests/kv13_movekey_test.cpp
+  LINK_LIBRARIES gufo_gemma4_hip gufo_gemma4 gufo_ext_hip)
+_gemma4_test(kv13_machinery "hip;gpu;gfx1151;cache;external-model" MODEL
+  SOURCES tests/kv13_machinery_test.cpp
+  LINK_LIBRARIES gufo_gemma4_hip gufo_gemma4 gufo_ext_hip)
 # The oracle-backed checks run unoptimized references; -O2 as for the oracle.
 set_source_files_properties(
   "${GUFO_EXTENSION_BUILD_ROOT}/tests/target_test.cpp"
