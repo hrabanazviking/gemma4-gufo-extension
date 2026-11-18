@@ -1954,3 +1954,74 @@ partial final tile, rows < Bc), 5 probes byte-identical,
 kv_cache_format PASS, then the R5 bench protocol. No gate
 claimed this tick. Phase 6 (KV-13) does not start; no
 quantized mode becomes any default.
+
+## Phase 5 REDO R3-E1 part 1 -- shared QkvPost helper + current-chunk descriptor plumbing (2026-11-17, builder tick 20:53 EST)
+
+Part 1 of R3-E1 (the audit's named next slice), banked as a
+coherent sub-step: the LDS-staged reproduction itself is
+part 2, still to come. No behavior change in part 1: no
+kernel consumes the new descriptor yet, and the factored
+store's arithmetic is byte-for-byte the code it replaces.
+
+What landed:
+- hip/kernels.hip.cpp: the plain (non-rotated) q8_0 row
+  store of QkvPostKernel is factored into the shared device
+  helper StoreQ8PlainBlocks<D>, in QkvPost's own
+  one-wave-per-(row, head) mapping (WaveMax block amax,
+  amax/127, __float2half scale, roundf codes -- unchanged).
+  The K-plain (KV-05) and V (KV-06) stores both call it;
+  the rotated-K store (KV-09) keeps its own packed form.
+  This is the mapping the part-2 LDS-staged reproduction
+  reuses.
+- hip/kernels.hpp: CurrentChunkArgs added beside
+  QkvPostArgs, and AttentionArgs gains a `current` field.
+  The descriptor carries exactly the audit's plumbing gap:
+  the segment's FP32 pre-transform K/V projections in
+  executor scratch (post.k / post.v) with post's row/v
+  strides, plus the transformation parameters that exist
+  only in QkvPostArgs (k_norm, theta_scale, freq_factors,
+  eps) and the segment's first_position / rows.
+- hip/executor.cpp: the executor populates att.current
+  from post for every prefill segment (post.k / post.v
+  already carry the segment's row0 offset). No consumer
+  yet; the cache write stays exactly as before.
+
+Verification (2026-11-17, device; binary result-r3e1 ->
+/nix/store/5lbam0mkzcyix8xz2fkr6x35brnrxgj4-gufo-0-unstable-4938016;
+MemAvailable 124,289,884 kB at build start and about
+124 GiB throughout, above the 40 GiB floor; Ollama :11434
+and gufo-resident.service untouched):
+- nix build clean (detached, exit 0; binary produced).
+- clang-format clean on all three touched files.
+- Host kv_cache_format test PASS (standalone compile),
+  roundtrip numbers identical to R2: K 0.010000 / 48.25 dB,
+  V 0.010000 / 48.15 dB, ring 0.006234, derived-K 0.015822 /
+  47.14 dB.
+- Probes (labels r3e1p1-q8 / r3e1p1-f16, same binary
+  result-r3e1/bin/gufo, GUFO_KV_CACHE_TYPE per label): all
+  five byte-identical q8_0 vs same-binary f16, Model Load
+  timing line excluded (FACT-1 Paris, FACT-2 Au, FACT-3
+  366, COH-1 same text, LONG-1 47-12-89), verified by
+  direct diff this tick. No regression from the refactor
+  or the plumbing.
+
+Next step: R3-E1 part 2 -- the LDS-staged reproduction
+proper, sliding D=256 only: a cooperative per-tile
+recompute step in QkvPost's mapping writing codes+scales
+to about 8.5 KB LDS staging in layout-v2 form, with
+fetch() reading LDS staging for current keys (per-key /
+per-8-chunk source switch on boundary tiles). Proof for
+part 2: the audit's differential device test (bypass vs
+staged bit-identical: first_position 0, unaligned 17,
+mid-window sliding, partial final tile, rows < Bc), the
+5 probes, and the host test; then R3-E2 (global D=512)
+and the R5 gate run. No gate claimed this tick. Phase 6
+(KV-13) does not start; no quantized mode becomes any
+default.
+
+Tick state: lock held during the work and removed before
+the banking commit, so no lock remains at tick end. The
+untracked results/ dirs are untouched and uncommitted,
+as ordered.
+
+Keeper closing note (2026-11-17 21:05 EST): the R3-E1 part 1 code slice banked as d2ce5e8 before this ledger section could be transferred; this docs commit banks the ledger itself. Verified after banking: local HEAD equals fork ls-remote, no lock remains, no live build/bench, MemAvailable about 124 GiB. Next tick: R3-E1 part 2.
