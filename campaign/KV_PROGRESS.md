@@ -2259,3 +2259,12 @@ Speed (median of 5, r3gate-q8 vs r3gate-f16, same binary):
 Verdict: the raised Phase 5 gate (q8_0 prefill strictly faster than same-binary f16 at pp512, pp4096 and pp16384) FAILED at all three lengths. The R3 executor-level staged-reproduction road is correct (bit-identical) but not fast: staging still costs more than the cache saving buys on the WMMA road. No gate is fudged or quietly passed; no quantized mode becomes any default; Phase 6 (KV-13) does NOT start.
 
 Blocker needing Volmarr's word, same shape as the R5 round-5 blocker he decided on 2026-11-17: (1) close Phase 5 with q8_0 prefill staying on the proven KV-11 non-WMMA road and the WMMA gate recorded as failed on the raised bar, or (2) commission another design round beyond R3. Keeper starts no new round without that word.
+
+## DECISION 3 — Owner ruling, 2026-11-18 (recorded by Yrsa from Volmarr's chat message)
+Volmarr, in substance verbatim: "we change the plan so we use non-compressed KV on the newest computer, but still do look for ways to speed up both Gufo and the extension of Gufo for Gemma."
+
+Rulings:
+1. **Production KV on the newest computer (purpleraider) is NON-COMPRESSED (f16).** The Phase 5 raised speed gate (q8_0 prefill strictly faster than f16 at 512/4k/16k) is RETIRED as a shipping gate — the loop-until-it-wins order of 2026-11-17 is closed by this ruling, with the honest record standing: two design families (WMMA dequant-tile staging; executor-level R3 bypass) failed the bar, probes byte-identical throughout, verdicts banked (final R5 re-run after R3-E1+E2: pp512 -8.8%, pp4096 -27.5%, pp16384 -37.7%).
+2. **q8_0 remains a proven-correct OPT-IN** (GUFO_KV_CACHE_TYPE=q8_0): probes byte-identical vs f16, cache ~41% smaller — for memory-tight uses, never the purpleraider default.
+3. Remaining KV slices re-scoped under this ruling: Phase 6 (KV-13) = correctness re-proof of the opt-in only; Phase 7 (KV-14/15) = wire the setting through the resident service with **f16 the default**; Phase 8 (KV-16) = close-out, this ruling IS the default decision.
+4. **NEW LINE COMMISSIONED:** the speed hunt continues beyond KV compression — a research-first speed campaign for BOTH the Gufo core fork and this Gemma4 extension (kernel, prefill and decode paths). Its roadmap is to be drafted and banked; the KV keeper's remaining work is the re-scoped slices above.
