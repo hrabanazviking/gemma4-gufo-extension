@@ -1888,3 +1888,9 @@ and the gate recorded as failed on the raised bar?
 ## Keeper tick 2026-11-17 20:24 EST -- blocker stands, no new round started
 
 Verified: local HEAD 9aa25ff equals fork ls-remote head, no prior lock, no live build/bench process, MemAvailable about 124 GiB (above 40 GiB floor). Ollama :11434 and gufo-resident.service untouched. R6 is exhausted and the Phase 5 raised-bar gate remains failed per round 5 record; the executor-level R3 redesign still needs Volmarr's word, or Phase 5 closes with q8_0 prefill on the KV-11 non-WMMA road. No builder round started, Phase 6 (KV-13) does NOT start, no quantized mode becomes any default.
+
+## Phase 5 REDO - executor-level R3 redesign APPROVED (2026-11-17 20:29 EST)
+
+Volmarr approved the executor-level R3 redesign as the next Phase 5 round, by his tap on the decision put to him in the main chat. The bounded R6 paths are exhausted and the raised gate stands failed; this approval opens the deeper round.
+
+Scope of the round: carry the R3 current-chunk bypass to executor level - restructure how the executor feeds current-chunk K/V into prefill attention so the q8_0 path stops paying the staging cost, arithmetic and accumulation order unchanged, probes byte-identical. Raised gate unchanged: q8_0 prefill strictly faster than same-binary f16 at pp512, pp4096 and pp16384, all 5 probes byte-identical, kv_cache_format test PASS. Phase 6 / KV-13 still waits on the Phase 5 gate. Keeper: start this round next tick.
