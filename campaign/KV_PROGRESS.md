@@ -2165,3 +2165,81 @@ this docs commit, so no lock remains at tick end. Untracked
 kv-harness diff sources, the run_roada_diff3.sh copy and
 results/ dirs (incl. roada-q8 / roada-f16) stay uncommitted,
 as ordered.
+
+## Phase 5 REDO R3-E2 BANKED -- global D=512 staged reproduction, quarter-tile LDS staging (2026-11-17, builder tick 23:26 EST)
+
+R3-E2, the R3 audit's follow-on slice for global layers,
+banked as ad53583 (+289 / -4 across hip/attention_wmma.hip.cpp
+and hip/kernels.hpp):
+
+- stage_quarter(): cooperative per-tile recompute of the
+  current chunk's global rows in QkvPost's own mapping -- one
+  wave per key, lane holding dims 32 b + lane (b < 16). The
+  norm sum pairs b and b + 8 per lane and WaveSums in w order,
+  exactly QkvPostKernel<512>'s (w, k) accumulation; K gets
+  k_norm then NEOX rope at the key's own position (pairs
+  b, b + 8, freq_factors honored); the V row quantizes plain
+  (StoreQ8PlainBlocks arithmetic, block b = dims [32 b, +32))
+  and the rotated-K row quantizes blocks b in {0, 1, 8, 9}
+  into packed blocks {0, 1, 2, 3} (the KV-09 store). Raw
+  unquantized values are never staged; the cache write stays
+  exactly as before.
+- LDS budget drove the shape: the global instantiation
+  already stages ~61 KB of tiles / scores / probabilities of
+  the 64 KB workgroup budget, so the full-tile staging the
+  audit estimated (~10.5 KB) does not fit. The tile is staged
+  four keys at a time -- V quarter 4 x 544 B, then rotated-K
+  quarter 4 x 136 B, 2,720 B in r3_stage -- and
+  fetch_global_q8() consumes each quarter before the next
+  overwrites it: the fused full-block (V) / half-block
+  (rotated K) loaders on full tiles, the per-chunk road on
+  partial tiles, current keys from the staging and all other
+  keys from the cache, per key. The fused loaders' __shfl
+  distributions run unconditionally every quarter (a staged
+  slot outside the quarter clamps to row 0); only the
+  register assignment is quarter-conditional. fetch() routes
+  global q8 with a current chunk to fetch_global_q8(); with
+  no current chunk every road is byte-for-byte the old one.
+
+Verification (2026-11-17, device; binary result-r3e2 ->
+/nix/store/sqrf1pwcapbn29hf95p91vgpkwd6nnl5-gufo-0-unstable-4938016;
+MemAvailable 124,286,040 kB at tick start and about 124 GiB
+throughout, above the 40 GiB floor; Ollama :11434 and
+gufo-resident.service untouched):
+- nix build clean (detached transient unit, exit 0; binary
+  produced). clang-format clean on both touched files.
+- Differential harness (new untracked r3e2_diff.hip.cpp,
+  run_r3e2_diff.sh; the diff3 fixture reworked for global
+  shapes: D=512, rotated_pairs 64, separate rotated-K / V
+  cache rows): ALL BIT-IDENTICAL, staged vs bypass, 0 floats
+  differ in every case -- A fused h32 kv4 rows27 (0/442368),
+  B fused rows64 full tiles (0/1048576), C packed rows27
+  (0/442368), D unaligned first_position 27 with history 27
+  (0/442368), E h16 kv2 rows33 with freq_factors (0/270336),
+  F rows17 with freq_factors, one full tile + 1-key tile
+  (0/278528), G packed h8 kv1 rows48 (0/196608), H history 64
+  / fp64 / rows27 mixed tiles (0/442368). The set covers
+  first_position 0, unaligned 27, partial final tiles, and
+  mixed history/current boundary tiles.
+- Host kv_cache_format test PASS (standalone compile),
+  roundtrip numbers identical to R2 / part 1 / road (a):
+  K 0.010000 / 48.25 dB, V 0.010000 / 48.15 dB, ring 0.006234,
+  derived-K 0.015822 / 47.14 dB.
+- Probes (labels r3e2-q8 / r3e2-f16, same binary
+  result-r3e2/bin/gufo, GUFO_KV_CACHE_TYPE per label): all
+  five byte-identical q8_0 vs same-binary f16, Model Load
+  timing line excluded (FACT-1 Paris, FACT-2 Au, FACT-3 366,
+  COH-1 same fox text, LONG-1 47-12-89). With the staged
+  road always on for global layers too, the real model's
+  global current chunks now reproduce QkvPost bit-for-bit.
+
+No gate claimed this tick: the Phase 5 R5 bench gate has
+NOT re-run. Next step: the R5 gate run (R3-E1 + R3-E2 both
+banked). Phase 6 (KV-13) does not start; no quantized mode
+becomes any default.
+
+Tick state: lock held during the work and removed before
+the banking commit, so no lock remains at tick end.
+Untracked kv-harness r3e2_diff sources, run_r3e2_diff.sh and
+results/ dirs (incl. r3e2-q8 / r3e2-f16) stay uncommitted,
+as ordered.
