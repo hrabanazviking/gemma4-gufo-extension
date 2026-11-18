@@ -117,8 +117,9 @@ void DraftConcat(const DraftConcatArgs& args, hipStream_t stream);
 /// (k_norm, theta_scale, freq_factors, eps). A future R3 slice
 /// reproduces the quantize->dequantize transformation from these
 /// fields in QkvPost's own mapping and stages the result in LDS;
-/// raw unquantized values are never attended. Part 1 is plumbing
-/// only: no kernel consumes this yet and behavior is unchanged.
+/// raw unquantized values are never attended. Part 1 was
+/// plumbing only; part 2 consumes it in the WMMA prefill kernel
+/// for sliding D=256 q8_0 layers (LDS-staged reproduction).
 /// Present iff k != nullptr.
 struct CurrentChunkArgs {
   const float* k{nullptr};
@@ -198,9 +199,10 @@ struct AttentionArgs {
   void* out_half;
   std::uint32_t siblings;
   std::uint32_t spare_key;
-  /// R3-E1 part 1: current-chunk descriptor (see CurrentChunkArgs);
-  /// populated by the executor for prefill segments, not yet
-  /// consumed by any kernel.
+  /// R3-E1: current-chunk descriptor (see CurrentChunkArgs);
+  /// populated by the executor for prefill segments; consumed by
+  /// the WMMA prefill kernel's LDS-staged reproduction for
+  /// sliding D=256 q8_0 layers (part 2), ignored elsewhere.
   CurrentChunkArgs current{};
   /// Decode widths: the output rows also fill this WMMA activation pack
   /// (width heads * head_dim) as its rows pack_row0 + r.

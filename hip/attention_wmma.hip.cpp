@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 #include "hip/half_store.hpp"
@@ -41,6 +43,41 @@ constexpr std::uint32_t kSliceSteps = kSlice / 16;
 
 __device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+
+/// R3-E1 part 2: full-wave butterflies for the LDS-staged
+/// current-chunk reproduction, mirroring WaveSum / WaveMax in
+/// hip/kernels.hip.cpp (xor masks 16, 8, 4, 2, 1, in that order):
+/// the same pairing tree, so a staged block's norm sum and amax
+/// are bit-for-bit QkvPost's.
+__device__ __forceinline__ float R3WaveSum(float v) {
+  v += __shfl_xor(v, 16);
+  v += __shfl_xor(v, 8);
+  v += __shfl_xor(v, 4);
+  v += __shfl_xor(v, 2);
+  return v + __shfl_xor(v, 1);
+}
+
+__device__ __forceinline__ float R3WaveMax(float v) {
+  v = fmaxf(v, __shfl_xor(v, 16));
+  v = fmaxf(v, __shfl_xor(v, 8));
+  v = fmaxf(v, __shfl_xor(v, 4));
+  v = fmaxf(v, __shfl_xor(v, 2));
+  return fmaxf(v, __shfl_xor(v, 1));
+}
+
+/// R3-E1 part 2: RopeAngle of hip/kernels.hip.cpp, mirrored
+/// exactly (the reproduction must turn K by the same angle
+/// QkvPost turned it by, at the key's own position).
+__device__ __forceinline__ float R3RopeAngle(std::uint32_t position,
+                                             std::uint32_t i, float theta_scale,
+                                             const float* freq_factors) {
+  float theta =
+      static_cast<float>(position) * powf(theta_scale, static_cast<float>(i));
+  if (freq_factors != nullptr) {
+    theta /= freq_factors[i];
+  }
+  return theta;
 }
 
 /// KV-12: dequantizes eight consecutive values of one q8_0 cache row
@@ -259,6 +296,14 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   // conflict two ways).
   __shared__ __align__(16) float s_lds[kRowBlocks][kWavesPerRow][16][16];
   __shared__ __align__(16) __half p_lds[kRowBlocks][16][kKeys + 8];
+  // R3-E1 part 2: LDS staging for the current chunk's reproduced
+  // q8_0 rows, sliding D=256 q8 only: 16 keys x (256 codes + 8
+  // fp16 scales) bytes for K, then the same for V -- one KV head,
+  // layout v2 per key (272-byte rows), 8704 bytes total.
+  // stage_tile() fills it per tile; fetch() reads current keys
+  // from it. One byte in every other instantiation.
+  __shared__ __align__(16) std::uint8_t
+      r3_stage[(D == 256 && !kGlobal && kQ8) ? 2 * kKeys * 272 : 1];
   __shared__ float row_scale[kRowBlocks][16];
   __shared__ float row_sum[kRowBlocks][16];
 
@@ -356,6 +401,104 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
       static_cast<std::size_t>(a.kv_heads) * (2 * kGlobalPairs / 32) * 34;
   const auto slot_of = [&](std::uint32_t key) {
     return a.ring != 0 ? key % a.ring : key;
+  };
+
+  // R3-E1 part 2: is `key` one of this segment's current-chunk
+  // keys (its reproduced row lives in r3_stage for its tile)?
+  const auto is_current = [&](std::uint32_t key) {
+    return a.current.k != nullptr && key >= a.current.first_position &&
+           key < a.current.first_position + a.current.rows;
+  };
+  // R3-E1 part 2: cooperative per-tile recompute of the current
+  // chunk's K/V rows into r3_stage, in QkvPost's own
+  // one-wave-per-(row, head) mapping: one wave per key, the lane
+  // holding dims 32 b + lane (b < 8), reproducing QkvPostKernel's
+  // arithmetic exactly -- the RMS norm as the in-order sum over
+  // the eight 32-blocks of each block's WaveSum, NEOX rope for K
+  // only at the key's own position, the per-block quantize of
+  // StoreQ8PlainBlocks (WaveMax amax, amax / 127, __float2half
+  // scale, roundf codes) -- so the staged codes and scales are
+  // bit-for-bit the cache rows QkvPost wrote for these keys, and
+  // fetch()'s DequantQ8Packed over them stages the identical
+  // tile. The cache write stays exactly as before; raw
+  // unquantized values are never staged. A barrier closes the
+  // step: fetch() reads r3_stage only after it.
+  const auto stage_tile = [&](std::uint32_t key0) {
+    if constexpr (D == 256 && !kGlobal && kQ8) {
+      if (a.current.k != nullptr) {
+        const std::uint32_t wave_id = tid >> 5U;
+        const std::size_t kv_row =
+            a.current.row_stride != 0
+                ? a.current.row_stride
+                : static_cast<std::size_t>(a.kv_heads) * D;
+        const std::size_t v_row =
+            a.current.v_stride != 0 ? a.current.v_stride
+                                    : static_cast<std::size_t>(a.kv_heads) * D;
+        for (std::uint32_t kl = wave_id; kl < kKeys; kl += kThreads / 32) {
+          const std::uint32_t key = key0 + kl;
+          if (!is_current(key)) {
+            continue;
+          }
+          const std::size_t local =
+              static_cast<std::size_t>(key - a.current.first_position);
+          std::uint8_t* rows_out[2] = {r3_stage + kl * 272,
+                                       r3_stage + (kKeys + kl) * 272};
+          const float* srcs[2] = {a.current.k + local * kv_row +
+                                      static_cast<std::size_t>(kv_head) * D,
+                                  a.current.v + local * v_row +
+                                      static_cast<std::size_t>(kv_head) * D};
+          for (int which = 0; which < 2; ++which) {
+            float v[8];
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+              v[b] = srcs[which][32 * b + lane];
+            }
+            float total = 0.0F;
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+              total += R3WaveSum(v[b] * v[b]);
+            }
+            const float r =
+                rsqrtf(total / static_cast<float>(D) + a.current.eps);
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+              const float x = v[b] * r;
+              v[b] = which == 0 && a.current.k_norm != nullptr
+                         ? x * a.current.k_norm[32 * b + lane]
+                         : x;
+            }
+            if (which == 0) {
+#pragma unroll
+              for (int b = 0; b < 4; ++b) {
+                const std::uint32_t d = 32 * b + lane;
+                const float theta = R3RopeAngle(key, d, a.current.theta_scale,
+                                                a.current.freq_factors);
+                const float c = __ocml_cos_f32(theta);
+                const float sn = __ocml_sin_f32(theta);
+                const float lo = v[b];
+                const float hi = v[b + 4];
+                v[b] = lo * c - hi * sn;
+                v[b + 4] = lo * sn + hi * c;
+              }
+            }
+            std::uint8_t* rowp = rows_out[which];
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+              const float amax = R3WaveMax(fabsf(v[b]));
+              const float dscale = amax / 127.0F;
+              const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
+              rowp[b * 32 + lane] = static_cast<std::uint8_t>(
+                  static_cast<std::int8_t>(roundf(v[b] * inv)));
+              if (lane == 0) {
+                *reinterpret_cast<__half*>(rowp + 256 + b * 2) =
+                    __float2half(dscale);
+              }
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
   };
 
   // Each thread stages kStage 8-half chunks of K and V per tile; the next
@@ -566,12 +709,25 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
       std::uint32_t ksb = 0;
       std::uint32_t vsb = 0;
       if (loader && valid) {
-        const std::uint32_t slot =
-            static_cast<std::uint32_t>(slot_of(position));
-        LoadQ8HalfBlockRaw(a.k_cache_q8, row_bytes_q8, slot, kv_head, D, d8, kw,
-                           &ksb);
-        LoadQ8HalfBlockRaw(a.v_cache_q8, row_bytes_q8, slot, kv_head, D, d8, vw,
-                           &vsb);
+        if (is_current(position)) {
+          // R3-E1 part 2: a current-chunk key; its codes and
+          // scales come from this tile's LDS staging (layout v2,
+          // one head), not from the cache -- the same half-block
+          // load against the staging base, so the dequantized
+          // chunk is bit-identical. The pair of lanes shares this
+          // one key, so one switch covers both chunks.
+          const std::uint32_t kl = position - key0;
+          LoadQ8HalfBlockRaw(r3_stage, 272, kl, 0, D, d8, kw, &ksb);
+          LoadQ8HalfBlockRaw(r3_stage + kKeys * 272, 272, kl, 0, D, d8, vw,
+                             &vsb);
+        } else {
+          const std::uint32_t slot =
+              static_cast<std::uint32_t>(slot_of(position));
+          LoadQ8HalfBlockRaw(a.k_cache_q8, row_bytes_q8, slot, kv_head, D, d8,
+                             kw, &ksb);
+          LoadQ8HalfBlockRaw(a.v_cache_q8, row_bytes_q8, slot, kv_head, D, d8,
+                             vw, &vsb);
+        }
       }
 #pragma unroll
       for (int w = 0; w < 4; ++w) {
@@ -753,6 +909,7 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
     }
   };
   if (block_lo < block_hi) {
+    stage_tile(block_lo);
     fetch(block_lo);
     store_keys();
     store_values();
@@ -765,6 +922,7 @@ __global__ void __launch_bounds__((kPrefillThreads<D, kHeads, kQueryBlocks>))
   for (std::uint32_t key0 = block_lo; key0 < block_hi; key0 += kKeys) {
     const bool more = key0 + kKeys < block_hi;
     if (more) {
+      stage_tile(key0 + kKeys);
       fetch(key0 + kKeys);
     }
 
