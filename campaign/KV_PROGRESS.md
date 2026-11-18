@@ -1742,3 +1742,107 @@ stand-down floor). No build or bench ran. Ollama :11434
 and gufo-resident.service untouched. Lock held during the
 audit and removed before the banking commit, so no lock
 remains at tick end.
+
+## Phase 5 REDO R6 -- E2 int8-WMMA QK spike: DECISION RULE RECORDED BEFORE IMPLEMENTATION (2026-11-17, builder tick 18:59 EST)
+
+Decision rule (from campaign/KV_PHASE5_REDO.md R6 E2, recorded
+here BEFORE any implementation, per the redo plan): variants
+A (bf16 reference) / B (pre-quantized Q) / C (runtime-quantized
+Q), one 16x64 score tile at d512 and d256, per-32 partial i32
+accumulators flushed into an fp32 master with the separable
+scale sQ*sK. If B cannot beat the fused R2 path (proxied in
+this microbenchmark by variant A, the bf16 WMMA path of the
+same tile shape), int8 QK is abandoned permanently. Even a
+fast spike is expected to fail byte identity; it is a
+measurement, not a shipping candidate. No kernel integration,
+no banking of a QK kernel change from E2 without a new
+decision record. Nothing from E2 ships past the probe gate.
+
+### E2 method (builder tick 2026-11-17, 18:59-19:20 EST)
+
+Standalone microbenchmark, harness only, no shipping kernel
+touched: campaign/kv-harness/e2_int8_qk_spike.hip.cpp +
+run_e2.sh (standalone hipcc compile, clr-10.1 hipcc from the
+nix store, --rocm-device-lib-path to the rocm-device-libs
+bitcode, --offload-arch=gfx1151, -O3; binary run from /tmp).
+One wave32 wave computes one 16x64 score tile
+S = Q[16][D] x K[64][D]^T; timing launches 256 independent
+waves x 200 tiles, hipEvent timed, 7 reps, median reported.
+Operands are loaded from global memory per WMMA step in all
+variants (no LDS staging), so variant A is the recorded
+microbenchmark proxy for the fused R2 path, and B's margin
+is an upper bound: the shipping kernel stages tiles in LDS
+and reuses them, which shrinks the operand-traffic share
+that B improves. Correctness spot-check per variant: one
+tile vs an fp32 CPU reference on deterministic data.
+
+Silicon fact established from the toolchain itself (clang
+BuiltinsAMDGPU.td, ROCm 24.0.0-rocm): on gfx1151 the int8
+WMMA is __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32 -- K-depth
+16, the SAME as f16 WMMA. No 16x16x32 iu8 w32 builtin exists.
+Per tile and depth, A and B issue the identical number of
+WMMA instructions (d512: 128; d256: 64); B accumulates two
+K=16 iu8 WMMA steps into one i32 partial per 32 dims and
+flushes it into the fp32 master with sQ[row,blk]*sK[key,blk],
+exactly the recorded per-32 design. There is therefore no
+matrix-core rate advantage for int8 on this silicon; any B
+win can only come from halved operand bytes and cheaper
+fragment loads. C quantizes Q inside the timed loop
+(per-(row,32) amax scale, codes staged in LDS) and then runs
+B's QK path; its first (buggy-stride) run read uninitialized
+LDS scales at d256 (check err inf), the stride bug was found
+and fixed, and the numbers below are the fixed run.
+
+### E2 measured numbers (fixed run, MemAvailable 124,340,104 kB)
+
+Device: AMD Radeon 8060S Graphics, gcnArch=gfx1151.
+Check maxabs err vs fp32 ref (scores, D-deep dot products):
+- d512: A 0.0210 | B 0.4381 | C 0.4436
+- d256: A 0.0161 | B 0.2834 | C 0.2787
+Median ns/tile (7 reps; spread = (max-min)/median):
+- d512: A 85.9 (8.1%) | B 74.7 (10.8%) | C 101.8 (35.3%)
+  reps A: 80.4 85.3 85.8 85.9 86.2 86.8 87.4
+  reps B: 68.4 73.5 74.6 74.7 75.4 76.5 76.5
+  reps C: 71.2 100.0 101.4 101.8 103.0 104.3 107.1
+- d256: A 43.3 (7.3%) | B 39.8 (13.3%) | C 53.8 (24.1%)
+  reps A: 40.5 42.0 42.9 43.3 43.4 43.6 43.7
+  reps B: 36.1 37.2 38.4 39.8 40.2 41.2 41.4
+  reps C: 43.4 53.5 53.6 53.8 54.0 54.0 56.4
+A confirming earlier run gave the same ordering at both
+depths (d512 B 73.4 vs A 84.1; d256 B 32.1 vs A 43.1).
+The lowest rep is systematically the first (clock ramp);
+medians are the recorded figures per protocol.
+
+### E2 verdict
+
+B BEATS the variant-A proxy at both depths: 1.15x at d512,
+1.09x at d256. The recorded decision rule's abandonment
+trigger (B cannot beat the fused R2 path proxy) therefore
+does NOT fire: int8 QK is not abandoned on speed grounds.
+But the win is narrow, comes with wide spreads, and -- per
+the silicon fact above -- cannot come from the matrix cores
+(identical WMMA count and K-depth); it is operand-traffic
+only, measured in a global-load microbenchmark that flatters
+it relative to the LDS-staged shipping kernel. C (runtime-
+quantized Q) LOSES to A at both depths (101.8 vs 85.9;
+53.8 vs 43.3): quantizing Q at runtime is a net loss.
+Byte identity fails exactly as the redo plan predicted:
+B/C score error vs the fp32 reference is ~20x A's
+(0.44/0.28 vs 0.021/0.016), an error the f16 build never
+had, so int8 QK would fail the probe gate. E2 remains a
+measurement, not a shipping candidate: NO kernel
+integration, NO QK kernel change banked, no new decision
+record requested this tick. Any future revival needs a new
+decision record that answers the byte-identity bar.
+
+### Tick state
+
+MemAvailable 124,399,248 kB at tick start, 124,340,104 kB
+at the measured run (about 124 GiB, well above the 40 GiB
+stand-down floor). Ollama :11434 and gufo-resident.service
+untouched. Phase 6 (KV-13) does NOT start. No quantized
+mode becomes any default. Lock held during the spike and
+removed before the banking commit, so no lock remains at
+tick end. Banked files: the two harness files above plus
+this ledger; the untracked results/ dirs are untouched and
+uncommitted, as ordered.
