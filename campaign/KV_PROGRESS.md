@@ -2025,3 +2025,74 @@ untracked results/ dirs are untouched and uncommitted,
 as ordered.
 
 Keeper closing note (2026-11-17 21:05 EST): the R3-E1 part 1 code slice banked as d2ce5e8 before this ledger section could be transferred; this docs commit banks the ledger itself. Verified after banking: local HEAD equals fork ls-remote, no lock remains, no live build/bench, MemAvailable about 124 GiB. Next tick: R3-E1 part 2.
+
+## Phase 5 REDO R3-E1 part 2 -- ROOT CAUSE FOUND: TU fast-math split (2026-11-17, builder tick 22:16 EST)
+
+Part 2 NOT banked: the gate's byte-identity bar is not met,
+and the failure is now localized with hard evidence.
+
+What was verified this tick (device; MemAvailable about
+124 GiB throughout, above the 40 GiB floor; Ollama :11434
+and gufo-resident.service untouched):
+- Differential tests (r3e1p2_diff cases A-F + corrupt proof,
+  r3e1p2_diff2 shapes G-M, and a new exact-COH-shape set
+  N-R: h16 kv8 fused, rows27, win1024, ring3328, in the
+  untracked r3e1p2_diff3.hip.cpp): ALL BIT-IDENTICAL,
+  staged vs bypass. The staged arithmetic mirrors QkvPost
+  exactly when both TUs are compiled with the harness's
+  uniform strict flags (-fno-fast-math -ffp-contract=off).
+- Real model (result-r3e1p2 binary, COH-1): staged ON gives
+  the divergent text; GUFO_R3_STAGED=0 (bypass, same binary,
+  q8_0) reproduces the f16 text exactly. The staged road is
+  the culprit; the real sliding call shape is rows=27 fp=0
+  heads=16 kv=8 D=256 win=1024 ring=3328 stride=8192
+  (captured via the TEMP GUFO_R3_DEBUG diagnostic, which is
+  still uncommitted in the tree and must never be banked).
+- A temporary staged-vs-cache byte check in stage_tile
+  (built as result-r3check, reverted after the run) counted
+  the reproduction error directly on COH-1: 10 code lanes +
+  5 fp16 scales differ out of 345,600 code comparisons
+  (25 sliding layers x 27 keys x K+V x 8 blocks x 32 lanes).
+  Every code diff is exactly +/-1; every scale diff is
+  exactly +/-1 fp16 ulp; both K (w=0) and V (w=1) affected,
+  all blocks. A last-ulp pre-quantize difference, not a
+  staging, mapping, rope, or boundary bug.
+
+ROOT CAUSE: extension.cmake compiles hip/kernels.hip.cpp
+(QkvPost) with -O3 -ffast-math -fno-finite-math-only,
+while hip/attention_wmma.hip.cpp (the staged reproduction)
+is compiled with those options PLUS -fno-fast-math
+-ffp-contract=off. Under fast-math, QkvPost's norm scale
+(rsqrtf), its amax/127 division, its 1/dscale reciprocal,
+and its reduction sums are approximated / contracted /
+reassociated; the strict-TU reproduction cannot be
+bit-identical to it in general. The harness never saw this
+because it compiles both TUs with uniform strict flags.
+
+Replication attempt (reverted): replacing the staged
+rsqrtf with raw v_rsq_f32, amax/127 with amax * (1/127f),
+and 1/dscale with raw v_rcp_f32 (result-r3fix1) cut the
+scale diffs 5 -> 1 but only cut code diffs 10 -> 8; the
+residual is consistent with fast-math reassociation of
+QkvPost's norm sum, which cannot be mirrored reliably
+from the strict TU. The tree is restored byte-for-byte
+to the tick-start uncommitted part-2 diff (+194 lines
+attention_wmma, +12/- kernels.hpp); no experiment code
+remains.
+
+Sanctioned roads for the next round (keeper / Volmarr to
+pick): (a) move QkvPostKernel into a TU compiled with the
+strict options (its outputs shift by ulps everywhere, so
+ALL gates re-verify: probes q8 vs f16, host test, diff
+test, decode consistency); (b) drop the in-kernel
+reproduction design for R3-E1 and record the change of
+plan in the roadmap. Road (a) contradicts part 1's
+recorded no-behavior-change property and needs its own
+slice. No gate is claimed this tick; Phase 6 (KV-13)
+does not start; no quantized mode becomes any default.
+
+Tick state: lock held during the work and removed before
+this docs commit, so no lock remains at tick end. Only
+this ledger is banked; the part-2 code stays uncommitted
+in the tree for the next round, and the untracked
+diff3 harness + results/ dirs stay uncommitted.
