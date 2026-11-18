@@ -84,7 +84,7 @@ Roadmap: `campaign/KV_Q8_ROADMAP.md`. Charter:
 | KV-11 non-WMMA prefill q8_0 | DONE | section below; probes byte-identical q8 vs f16; pp4096 +40.7 pct, pp16384 +103.8 pct vs KV-10 q8 |
 | KV-12 WMMA prefill / dispatch rule | SUPERSEDED BY REDO 2026-11-17, GATE OPEN | section below; WMMA dequant-tile stage landed, probes byte-identical; pp16384 -2.98 pct vs f16 is real, beyond noise -- Phase 5 gate not yet passed |
 | KV-13 machinery re-proof | DONE | section below; snapshot machinery made format-aware and re-proven in both formats; MoveKey kernel-proven byte-exact over q8_0; MTP chain named gap (no draft GGUF on this machine) |
-| KV-14 full-stack integration | PENDING | |
+| KV-14 full-stack integration | DONE | section below; supervisor resolves + explicitly passes GUFO_KV_CACHE_TYPE (f16 default), meta reports kv_cache_type; f16 and q8_0 loads both proven, f16 restored |
 | KV-15 resident service re-proof | PENDING | |
 | KV-16 soak + default decision + close | PENDING | |
 
@@ -2371,3 +2371,65 @@ existing target_test boundary failure on the dev core road; MTP
 chain asset gap) are recorded with owners, per the gate's own
 terms. Slices banked: 12 of 16 (KV-01..KV-11, KV-13). Next:
 KV-14 (Phase 7 integration, f16 default per Decision 3).
+
+## Phase 7 first slice (KV-14) -- full-stack integration, f16 default
+
+What landed:
+- Extension side needed no change: provider_options.hpp already
+  resolves --kv-cache-type > GUFO_KV_CACHE_TYPE > f16, with a
+  named error on an invalid value (KV-04).
+- Supervisor side (gufo-dev, branch yrsa/our-gufo, commit
+  e3a0c155, pushed to the fork and ls-remote verified):
+  tools/gufo-resident/gufo_supervisor.py gains
+  env_kv_cache_type() -- unset/empty = f16 (Decision 3:
+  production KV is non-compressed), f16|q8_0 accepted, any
+  other value raises a clear named ValueError at startup,
+  never a silent fallback. Config.kv_cache_type carries the
+  resolved value; _start_child sets GUFO_KV_CACHE_TYPE
+  explicitly in the engine child env; the meta surface reports
+  kv_cache_type on /api/version, /api/ps (loaded entry) and
+  /api/tags (per model); startup logs the resolved type.
+  campaign/STATE.md there carries the matching addendum.
+- Full stack rebuilt and installed: nix build of this tree
+  (HEAD 2b61bc2) clean, store
+  /nix/store/lnb7f2iv...-gufo-0-unstable-4938016; nix profile
+  now carries that build (old 4f73737 package removed, new
+  added). Supervisor deployed byte-identical to
+  ~/.local/lib/gufo-resident/gufo_supervisor.py.
+  gufo-resident.service is a SYSTEM unit: restarts were
+  sudo systemctl restart gufo-resident.service (no user
+  systemd / XDG road involved). Ollama :11434 untouched
+  (answered /api/version 0.40.16 throughout).
+
+Verification (2026-11-18, device; MemAvailable ~124 GiB
+throughout, above the 40 GiB floor):
+- Bad value, throwaway supervisor start (no service impact):
+  GUFO_KV_CACHE_TYPE=bogus -> ValueError: GUFO_KV_CACHE_TYPE:
+  unknown KV cache type 'bogus'; use f16 or q8_0. Import with
+  q8_0 -> CFG.kv_cache_type q8_0; unset -> f16.
+- Default f16: service restarted, resting meta --
+  /api/version {version: resident 1.0.0 / gufo development
+  (4938016), kv_cache_type: f16}; /api/tags carries
+  kv_cache_type f16; /api/ps empty (resting). First chat call
+  loaded the model (~6 s wall incl. load) and the one-word
+  probe answered Paris. While loaded, /api/ps reported
+  kv_cache_type f16 on the model entry. keep_alive 0 unloaded
+  back to resting.
+- Opt-in q8_0: drop-in
+  /etc/systemd/system/gufo-resident.service.d/10-kv-cache.conf
+  (Environment=GUFO_KV_CACHE_TYPE=q8_0), daemon-reload,
+  restart. /api/version reported kv_cache_type q8_0; a chat
+  call loaded (~4.7 s wall) and answered Paris; /api/ps and
+  /api/tags reported q8_0 while loaded.
+- Restore: drop-in removed, daemon-reload, restart --
+  /api/version reports f16, /api/ps empty, service active and
+  resting with the f16 default (Decision 3). Journal shows
+  the startup line: kv cache type: f16 (from
+  GUFO_KV_CACHE_TYPE; f16 is the default).
+
+**Phase 7 first slice: DONE** 2026-11-18 -- the resident
+supervisor passes GUFO_KV_CACHE_TYPE through explicitly and
+reports the active format; f16 is the production default,
+q8_0 a proven opt-in. Slices banked: 13 of 16
+(KV-01..KV-11, KV-13, KV-14). Next: KV-15 (resident service
+end-to-end re-proof).
