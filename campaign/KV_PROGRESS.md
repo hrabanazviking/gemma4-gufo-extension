@@ -1894,3 +1894,63 @@ Verified: local HEAD 9aa25ff equals fork ls-remote head, no prior lock, no live 
 Volmarr approved the executor-level R3 redesign as the next Phase 5 round, by his tap on the decision put to him in the main chat. The bounded R6 paths are exhausted and the raised gate stands failed; this approval opens the deeper round.
 
 Scope of the round: carry the R3 current-chunk bypass to executor level - restructure how the executor feeds current-chunk K/V into prefill attention so the q8_0 path stops paying the staging cost, arithmetic and accumulation order unchanged, probes byte-identical. Raised gate unchanged: q8_0 prefill strictly faster than same-binary f16 at pp512, pp4096 and pp16384, all 5 probes byte-identical, kv_cache_format test PASS. Phase 6 / KV-13 still waits on the Phase 5 gate. Keeper: start this round next tick.
+
+## Phase 5 REDO - executor-level R3 audit (2026-11-17, keeper tick 20:34 EST)
+
+Approved round started. Audit only this tick: no builds or
+benches run, MemAvailable about 124 GiB (above the 40 GiB
+floor), Ollama :11434 and gufo-resident.service untouched.
+
+Round trip found: QkvPost (executor.cpp, call at :1013) writes
+current-chunk K/V to the global q8_0 cache, then the WMMA
+kernel re-reads them tile by tile from the cache in fetch()
+(attention_wmma.hip.cpp :423-765), same layer, same stream,
+back-to-back. The cache write must stay (later chunks and
+decode need it); the R3 bypass saves only the re-read.
+
+Chunk vs tile: Bc = kKeys = 16 (attention_wmma :38); nominal
+prefill chunk 2048 = 128 x Bc and aligned, but alignment is
+not guaranteed (remainder chunk, image cuts, segment edges,
+sliding window lo). Boundary tiles mix history and current
+keys, so the source switch must be per-key / per-8-chunk,
+not per-tile.
+
+Held at attention time: executor scratch q_/k_/v_
+(executor.hpp :326-328). k_/v_ still hold the FP32
+pre-transformation projections (QkvPost reads them const;
+it overwrites only q_ and the caches), with layout/strides
+already in post.k/post.v/row_stride/v_stride
+(executor.cpp :940-1013). Transformation parameters
+(k_norm, theta, freq factors, eps, rotated pairs) exist
+only in QkvPostArgs: the plumbing gap is a current-chunk
+descriptor in AttentionArgs (kernels.hpp :39/139) beside
+the QkvPost args.
+
+In-register reproduction (hard rule): recompute full-head
+RMS norm in QkvPost WaveSum order, NEOX rope for K only at
+the key's own position, per-32-block quantize (amax/127,
+__float2half scale, roundf codes), dequantize via
+DequantQ8Packed (__hmul(__int2half_rn(code), scale)) into
+the existing LDS tile via store_keys/store_values. Raw
+unquantized values are forbidden and would be wrong
+(un-normalized, un-rotated). Obstacle: QkvPost's
+one-wave-per-(row,head) mapping gets the block amax free,
+while WMMA fetch spreads a block across lanes (two waves
+for sliding), so in-fetch needs extra reductions.
+
+Next slice named: R3-E1, LDS-staged reproduction, sliding
+D=256 first - a cooperative per-tile recompute step in
+QkvPost's own mapping (shared device helper factored out
+of QkvPostKernel, kernels.hip.cpp :464) writing codes and
+scales to about 8.5 KB LDS staging in layout-v2 form;
+fetch() then reads LDS staging for current keys, otherwise
+unchanged. R3-E2 follows for global D=512 (dual V-row and
+rotated-K stores, about 10.5 KB). Risks: LDS/occupancy on
+64 KB gfx1151, extra syncthreads on the prefetch path,
+norm/rope drift, mixed boundary tiles. Proof required:
+differential device test bypass vs staged bit-identical
+(first_position 0, unaligned 17, mid-window sliding,
+partial final tile, rows < Bc), 5 probes byte-identical,
+kv_cache_format PASS, then the R5 bench protocol. No gate
+claimed this tick. Phase 6 (KV-13) does not start; no
+quantized mode becomes any default.
