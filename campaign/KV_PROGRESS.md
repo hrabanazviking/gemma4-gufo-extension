@@ -2243,3 +2243,19 @@ the banking commit, so no lock remains at tick end.
 Untracked kv-harness r3e2_diff sources, run_r3e2_diff.sh and
 results/ dirs (incl. r3e2-q8 / r3e2-f16) stay uncommitted,
 as ordered.
+
+## Phase 5 REDO R5 gate re-run after R3-E1 + R3-E2 -- GATE FAILED on the raised bar (2026-11-18, keeper tick 00:44 EST)
+
+Gate run executed on the banked R3-E2 binary (result-r3e2, run_gate_r3.sh: host test, probes q8/f16, matrix q8/f16; started 00:17 EST, done 00:38 EST, gate-r3.done present). This tick verified the finished run from disk, cross-checked it against the independent r5redo run (23:47-00:10 EST) -- medians agree within noise, so the result is reproducible, not contention. MemAvailable about 124 GiB throughout (above the 40 GiB floor); Ollama :11434 and gufo-resident.service untouched. No live build/bench at tick time; the 00:16 lock was stale after the gate run finished and was removed by this tick.
+
+Correctness: PASS. All 5 probes byte-identical q8_0 vs same-binary f16 excluding the Model Load timing line (FACT-1 Paris, FACT-2 Au, FACT-3 366, COH-1 same fox text, LONG-1 47-12-89). Host kv_cache_format test PASS (K 0.010000 / 48.25 dB, V 0.010000 / 48.15 dB, ring 0.006234, derived-K 0.015822 / 47.14 dB).
+
+Speed (median of 5, r3gate-q8 vs r3gate-f16, same binary):
+- pp512: 2009.25 vs 2203.00 tok/s = -8.8 pct
+- pp4096: 2108.98 vs 2909.11 tok/s = -27.5 pct
+- pp16384: 1575.40 vs 2529.48 tok/s = -37.7 pct
+- decode tg512: 36.55 vs 41.88 = -12.7 pct; tg4096: 33.21 vs 40.42 = -17.8 pct; tg16384: 32.15 vs 39.09 = -17.8 pct (recorded honestly; the raised gate was prefill, but decode also regressed on this binary)
+
+Verdict: the raised Phase 5 gate (q8_0 prefill strictly faster than same-binary f16 at pp512, pp4096 and pp16384) FAILED at all three lengths. The R3 executor-level staged-reproduction road is correct (bit-identical) but not fast: staging still costs more than the cache saving buys on the WMMA road. No gate is fudged or quietly passed; no quantized mode becomes any default; Phase 6 (KV-13) does NOT start.
+
+Blocker needing Volmarr's word, same shape as the R5 round-5 blocker he decided on 2026-11-17: (1) close Phase 5 with q8_0 prefill staying on the proven KV-11 non-WMMA road and the WMMA gate recorded as failed on the raised bar, or (2) commission another design round beyond R3. Keeper starts no new round without that word.
