@@ -1052,6 +1052,22 @@ void Executor::Forward(std::span<const Segment> segments,
                            : nullptr;
       att.siblings = post.siblings;
       att.spare_key = post.spare_key;
+      // R3-E1 part 1: current-chunk descriptor plumbing. The
+      // descriptor mirrors this segment's QkvPost inputs (post.k /
+      // post.v already carry the segment's row0 offset, and post's
+      // strides describe the executor scratch layout), so a future
+      // R3 slice can reproduce the transformation at attention
+      // time. No kernel consumes it yet; behavior is unchanged.
+      att.current.k = post.k;
+      att.current.v = post.v;
+      att.current.k_norm = post.k_norm;
+      att.current.theta_scale = post.theta_scale;
+      att.current.freq_factors = post.freq_factors;
+      att.current.eps = post.eps;
+      att.current.first_position = post.first_position;
+      att.current.rows = post.rows;
+      att.current.row_stride = post.row_stride;
+      att.current.v_stride = post.v_stride;
       att.pack = attn_pack;
       att.pack_row0 = row0;
       DeriveKeys(att, l);

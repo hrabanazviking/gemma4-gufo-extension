@@ -455,6 +455,44 @@ __device__ void FoldKeyWeight(float* buf, std::uint32_t dim,
   __syncthreads();
 }
 
+/// R3-E1 part 1: the plain (non-rotated) q8_0 row store of
+/// QkvPostKernel, factored into a shared device helper in
+/// QkvPost's own one-wave-per-(row, head) mapping. One 32-value
+/// block lies in one wave: lane holds dim 32 * (w + kWaves * k) +
+/// lane of this head, so WaveMax gives the block amax and each
+/// lane writes its own code; lane 0 writes the fp16 scale.
+/// Matches QuantizeQ8_0Row on the host. The K-plain (KV-05) and
+/// V (KV-06) stores of QkvPostKernel both call this; the rotated-K
+/// store (KV-09) keeps its own packed form. A future R3 slice
+/// reuses this mapping for the LDS-staged reproduction.
+template<int D>
+__device__ __forceinline__ void StoreQ8PlainBlocks(
+    const float (&v)[kWaves][D / kThreads], int lane, std::uint32_t kvh,
+    std::uint32_t slot, std::uint8_t* cache_q8, std::uint32_t kv_heads) {
+  constexpr int K = D / kThreads;
+  const std::size_t row_values = static_cast<std::size_t>(kv_heads) * D;
+  const std::size_t row_bytes = Q8RowBytes(row_values);
+  std::uint8_t* row_q8 = cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
+  constexpr std::uint32_t kBlocksPerHead = D / 32;
+#pragma unroll
+  for (int w = 0; w < kWaves; ++w) {
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      const std::uint32_t blk = kvh * kBlocksPerHead + w + kWaves * k;
+      std::uint8_t* out = Q8BlockCodes(row_q8, blk);
+      const float amax = WaveMax(fabsf(v[w][k]));
+      const float dscale = amax / 127.0F;
+      const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
+      out[lane] = static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(roundf(v[w][k] * inv)));
+      if (lane == 0) {
+        *reinterpret_cast<__half*>(Q8BlockScale(row_q8, row_values, blk)) =
+            __float2half(dscale);
+      }
+    }
+  }
+}
+
 /// One wave per (row, head), eight heads of a row per block. Lane L holds
 /// dims 32 w + L + 256 k (w < 8, k < D / 256): exactly the elements thread
 /// 32 w + L held in the block-per-head form, so the per-thread partial sums,
@@ -571,32 +609,9 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
   const std::size_t rot_at =
       (static_cast<std::size_t>(slot) * a.kv_heads + kvh) * 2 * pairs;
   if (a.k_cache_q8 != nullptr && pairs == 0) {
-    // KV-05: q8_0 K store. One 32-value block lies in one wave: lane
-    // holds dim 32 * (w + kWaves * k) + lane of this head, so WaveMax
-    // gives the block amax and each lane writes its own code; lane 0
-    // writes the fp16 scale. Matches QuantizeQ8_0Row on the host.
-    const std::size_t row_values = static_cast<std::size_t>(a.kv_heads) * D;
-    const std::size_t row_bytes = Q8RowBytes(row_values);
-    std::uint8_t* row_q8 =
-        a.k_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
-    constexpr std::uint32_t kBlocksPerHead = D / 32;
-#pragma unroll
-    for (int w = 0; w < kWaves; ++w) {
-#pragma unroll
-      for (int k = 0; k < K; ++k) {
-        const std::uint32_t blk = kvh * kBlocksPerHead + w + kWaves * k;
-        std::uint8_t* out = Q8BlockCodes(row_q8, blk);
-        const float amax = WaveMax(fabsf(v[w][k]));
-        const float dscale = amax / 127.0F;
-        const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
-        out[lane] = static_cast<std::uint8_t>(
-            static_cast<std::int8_t>(roundf(v[w][k] * inv)));
-        if (lane == 0) {
-          *reinterpret_cast<__half*>(Q8BlockScale(row_q8, row_values, blk)) =
-              __float2half(dscale);
-        }
-      }
-    }
+    // KV-05: q8_0 K store, via the shared StoreQ8PlainBlocks
+    // helper (R3-E1 part 1; arithmetic unchanged).
+    StoreQ8PlainBlocks<D>(v, lane, kvh, slot, a.k_cache_q8, a.kv_heads);
   } else if (a.k_cache_q8 != nullptr && pairs != 0) {
     // KV-09: q8_0 rotated-K store for derived-key layers. The packed
     // row holds, per head, the rotated dims [0, pairs) then
@@ -651,35 +666,12 @@ __global__ void __launch_bounds__(kThreads) QkvPostKernel(QkvPostArgs a) {
   load(a.v + row * v_row + std::size_t{kvh} * D, v);
   norm_rope(v, nullptr, false);
   if (a.v_cache_q8 != nullptr) {
-    // KV-06: q8_0 V store, the same block layout and slot/ring
-    // addressing as the KV-05 K store above: one 32-value block lies
-    // in one wave, WaveMax gives the block amax, each lane writes its
-    // own code, lane 0 writes the fp16 scale. Matches
-    // QuantizeQ8_0Row on the host. KV-09: derived-key layers take
-    // this branch too -- their V row is the normalized K projection,
-    // stored exactly like a sliding V row.
-    const std::size_t row_values = static_cast<std::size_t>(a.kv_heads) * D;
-    const std::size_t row_bytes = Q8RowBytes(row_values);
-    std::uint8_t* row_q8 =
-        a.v_cache_q8 + static_cast<std::size_t>(slot) * row_bytes;
-    constexpr std::uint32_t kBlocksPerHead = D / 32;
-#pragma unroll
-    for (int w = 0; w < kWaves; ++w) {
-#pragma unroll
-      for (int k = 0; k < K; ++k) {
-        const std::uint32_t blk = kvh * kBlocksPerHead + w + kWaves * k;
-        std::uint8_t* out = Q8BlockCodes(row_q8, blk);
-        const float amax = WaveMax(fabsf(v[w][k]));
-        const float dscale = amax / 127.0F;
-        const float inv = dscale != 0.0F ? 1.0F / dscale : 0.0F;
-        out[lane] = static_cast<std::uint8_t>(
-            static_cast<std::int8_t>(roundf(v[w][k] * inv)));
-        if (lane == 0) {
-          *reinterpret_cast<__half*>(Q8BlockScale(row_q8, row_values, blk)) =
-              __float2half(dscale);
-        }
-      }
-    }
+    // KV-06: q8_0 V store, via the shared StoreQ8PlainBlocks
+    // helper (R3-E1 part 1; arithmetic unchanged). KV-09:
+    // derived-key layers take this branch too -- their V row is
+    // the normalized K projection, stored exactly like a sliding
+    // V row.
+    StoreQ8PlainBlocks<D>(v, lane, kvh, slot, a.v_cache_q8, a.kv_heads);
   } else {
 #pragma unroll
     for (int w = 0; w < kWaves; ++w) {

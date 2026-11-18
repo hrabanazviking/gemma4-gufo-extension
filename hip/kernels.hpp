@@ -108,6 +108,31 @@ struct DraftConcatArgs {
 };
 void DraftConcat(const DraftConcatArgs& args, hipStream_t stream);
 
+/// R3-E1 part 1: current-chunk descriptor for the executor-level R3
+/// bypass (audit: campaign/KV_PROGRESS.md, Phase 5 REDO R3 audit).
+/// It mirrors, for one segment, exactly the inputs QkvPost consumed
+/// for that segment: the FP32 pre-transform K/V projections in
+/// executor scratch (post.k / post.v, with post's row strides) and
+/// the transformation parameters that exist only in QkvPostArgs
+/// (k_norm, theta_scale, freq_factors, eps). A future R3 slice
+/// reproduces the quantize->dequantize transformation from these
+/// fields in QkvPost's own mapping and stages the result in LDS;
+/// raw unquantized values are never attended. Part 1 is plumbing
+/// only: no kernel consumes this yet and behavior is unchanged.
+/// Present iff k != nullptr.
+struct CurrentChunkArgs {
+  const float* k{nullptr};
+  const float* v{nullptr};
+  const float* k_norm{nullptr};
+  float theta_scale{0.0F};
+  const float* freq_factors{nullptr};
+  float eps{0.0F};
+  std::uint32_t first_position{0};
+  std::uint32_t rows{0};
+  std::uint32_t row_stride{0};
+  std::uint32_t v_stride{0};
+};
+
 /// Scale-1 attention of FP32 queries over binary16 K/V caches.
 /// Row r queries position `first_position + r` (or `first_position` for all
 /// rows when `shared_position`), attends keys [lo, hi) with
@@ -173,6 +198,10 @@ struct AttentionArgs {
   void* out_half;
   std::uint32_t siblings;
   std::uint32_t spare_key;
+  /// R3-E1 part 1: current-chunk descriptor (see CurrentChunkArgs);
+  /// populated by the executor for prefill segments, not yet
+  /// consumed by any kernel.
+  CurrentChunkArgs current{};
   /// Decode widths: the output rows also fill this WMMA activation pack
   /// (width heads * head_dim) as its rows pack_row0 + r.
   WmmaPackOut pack;
