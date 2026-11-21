@@ -1,0 +1,26 @@
+2026-11-17 13:22:17 [INFO] [gpu] event=queue_budget kind=llm observed=0 budget=8 expected_max=3 cap=2
+2026-11-17 13:22:17 [INFO] [loader] event=load_started kind=text artifact=/home/volmarr/models/gufo/gemma-4-26B-A4B-it-heretic.Q8_0.gguf rss_mib=138 host_available_mib=121302
+2026-11-17 13:22:17 [WARN] [gemma4] unqualified gemma4 chat template (sha256 2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c); rendering prompts with the built-in gemma4-unsloth-845f1ee4 template
+2026-11-17 13:22:21 [INFO] [loader] event=load_phase phase=sessions rss_mib=344 host_available_mib=94108
+2026-11-17 13:22:22 [INFO] [cache] schema=component-cache-v1 event=backing_prepared committed_bytes=2280587264 long_term_pinned_bytes=0
+2026-11-17 13:22:22 [INFO] [cache] schema=component-cache-v1 event=configured sessions=1 snapshot_entries=128 capacity_bytes=34359738368 staging_capacity_bytes=0 automatic_bytes=34359738368 max_bytes=77512687616 disk_capacity_bytes=0 slot_pinned_bytes=0 ram_cache=on disk_backing_bytes=0
+2026-11-17 13:22:22 [INFO] [loader] event=structured_output_prepared vocabulary_tokens=262144 prepare_ms=43.7 rss_delta_kib=36000 rss_mib=2567 host_available_mib=90362
+2026-11-17 13:22:22 [INFO] [sampling] event=defaults thinking=auto temperature=1 top_k=64 top_p=0.95 min_p=0 min_keep=0 seed=-1 repeat_penalty=1 repeat_last_n=64 frequency_penalty=0 presence_penalty=0
+2026-11-17 13:22:22 [INFO] [loader] event=load_completed kind=text elapsed_ms=4491 monotonic_us=235393397858 model=kv-probe sessions=1 context_tokens=32768 speculative=off draft_limit=7 disk_cache=off rss_mib=2536 host_available_mib=90362 gpu_device_used_mib=28478 gpu_device_total_mib=102400
+2026-11-17 13:22:22 [INFO] [server] event=listening monotonic_us=235393398101 address=http://127.0.0.1:18200 max_connections=16 max_body_bytes=8388608
+2026-11-17 13:22:22 [INFO] [http] request=r1 event=received method=POST path=/v1/chat/completions body_bytes=73662
+2026-11-17 13:22:22 [INFO] [cache] schema=component-cache-v1 event=acquire reuse=none selected_tokens=0 restored_bytes=0
+2026-11-17 13:22:23 [INFO] [cache] schema=component-cache-v1 event=retention action=0 reason=0 tokens=2048 purpose=1 rank=3 unique_bytes_freed=0 ledger_bytes=2756549131
+2026-11-17 13:22:24 [INFO] [cache] schema=component-cache-v1 event=retention action=0 reason=0 tokens=6144 purpose=1 rank=3 unique_bytes_freed=0 ledger_bytes=2890948660
+2026-11-17 13:22:26 [INFO] [cache] schema=component-cache-v1 event=retention action=0 reason=0 tokens=10240 purpose=1 rank=3 unique_bytes_freed=0 ledger_bytes=3159519581
+2026-11-17 13:22:28 [INFO] [cache] schema=component-cache-v1 event=retention action=0 reason=0 tokens=14336 purpose=1 rank=3 unique_bytes_freed=0 ledger_bytes=3428109702
+2026-11-17 13:22:28 [INFO] [cache] schema=component-cache-v1 event=retention action=0 reason=0 tokens=15732 purpose=2 rank=3 unique_bytes_freed=0 ledger_bytes=3696660487
+2026-11-17 13:22:28 [INFO] [cache] schema=component-cache-v1 event=retention action=0 reason=0 tokens=15739 purpose=0 rank=0 unique_bytes_freed=0 ledger_bytes=3696763204
+2026-11-17 13:22:28 [INFO] [http] request=r1 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=6275.7 outcome=completed prompt_tokens=15739 prefill_tokens=15739 generated_tokens=8 finish=stop cache=miss cached_tokens=0 cache_restore_ms=0.0 queue_depth=1 resident_at_admission=1 queue_ms=11.4 shared_prefix_wait_ms=0.0 ttft_ms=6060.8 prefill_tps=2601.8 decode_tps=38.0 batch_width=1 plan=serial-c1 draft_accepted=0 draft_proposed=0 draft_rounds=0 cache_schema=component-cache-v1 cache_reuse=none cache_captures=6 cache_captured_capacity_bytes=1289158656 cache_global_ledger_bytes=3696890725 cache_snapshot_bytes=1280921116 cache_miss_reason=no_checkpoint common_prefix_tokens=0 nearest_checkpoint_tokens=0 rss_mib=3495 host_available_mib=89385
+2026-11-17 13:22:29 [INFO] [server] event=shutdown_requested signal=15
+2026-11-17 13:22:29 [INFO] [cache] schema=component-cache-v1 event=retention action=2 reason=9 tokens=2048 purpose=1 rank=1 unique_bytes_freed=160169 ledger_bytes=3696578815
+2026-11-17 13:22:29 [INFO] [cache] schema=component-cache-v1 event=retention action=2 reason=9 tokens=6144 purpose=1 rank=1 unique_bytes_freed=179369 ledger_bytes=3696399446
+2026-11-17 13:22:29 [INFO] [cache] schema=component-cache-v1 event=retention action=2 reason=9 tokens=10240 purpose=1 rank=1 unique_bytes_freed=198569 ledger_bytes=3696200877
+2026-11-17 13:22:29 [INFO] [cache] schema=component-cache-v1 event=retention action=2 reason=9 tokens=14336 purpose=1 rank=1 unique_bytes_freed=217769 ledger_bytes=3695983108
+2026-11-17 13:22:29 [INFO] [cache] schema=component-cache-v1 event=retention action=2 reason=9 tokens=15732 purpose=2 rank=3 unique_bytes_freed=102633 ledger_bytes=3695880475
+2026-11-17 13:22:29 [INFO] [cache] schema=component-cache-v1 event=retention action=2 reason=9 tokens=15739 purpose=0 rank=3 unique_bytes_freed=326277 ledger_bytes=3695554198

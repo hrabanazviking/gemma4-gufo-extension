@@ -1,0 +1,98 @@
++ export PKG_CONFIG_PATH=/nix/store/qi0whsif4mi6a0d88d51qk4fa6bgns89-libsndfile-1.2.2-dev/lib/pkgconfig:/nix/store/ym4x29qyz0pr1r4qd82y2836bdycfl2f-rocm-runtime-10.1/lib/pkgconfig:/nix/store/i8jf1bw06qbvb9w7apkz1zy796fnyizw-icu4c-78.3-dev/lib/pkgconfig:/nix/store/zxvysjs44vl0hh0iqmh1s9jfjv9725x9-curl-8.22.0-dev/lib/pkgconfig:/nix/store/vqqz42af3hm89plcfg6sxmic32v2praa-brotli-1.2.0-dev/lib/pkgconfig:/nix/store/36jqif7m8jgnk14zaxzs6fl9lknjch8w-krb5-1.22.2-dev/lib/pkgconfig:/nix/store/f5f0aiz1kvr59vxaw90sh1l37sawbbw0-nghttp2-1.70.0-dev/lib/pkgconfig:/nix/store/ii34lqar1njxh1iwdh8x1jn64a6dwb6k-nghttp3-1.18.0-dev/lib/pkgconfig:/nix/store/3a2f8ap1mw785l27mrwxjnbkx8p96r09-ngtcp2-1.23.0-dev/lib/pkgconfig:/nix/store/i1kkgraqhy9g3ji3mp8xp3hf9mwzxmbr-libidn2-2.3.8-dev/lib/pkgconfig:/nix/store/wps4g7kaj73d2zs53a5cfimw1bnb3c99-openssl-3.5.9-dev/lib/pkgconfig:/nix/store/k06ix9y47imj2qwk22633l76k1ijkpk5-libpsl-0.21.5-dev/lib/pkgconfig:/nix/store/f995x45394l89346wpwkpc08fxj8glvg-libssh2-1.11.1-dev/lib/pkgconfig:/nix/store/a76rmqrp6l3w6h9pppfwzb3s6dzi0y4g-zlib-1.3.2-dev/share/pkgconfig:/nix/store/l9f17m3j280r2gmb7gksl4r1dycxylin-zstd-1.5.7-dev/lib/pkgconfig:/nix/store/27jrn36s7jkk6xv6vgi9kq8shkybafp1-libpng-apng-1.6.59-dev/lib/pkgconfig:/nix/store/bknqdwimgfpajqyarn8hs6fm08zn86cn-libjpeg-turbo-3.2.0-dev/lib/pkgconfig:/nix/store/xg48dl68ar4ivqlid9rbdi3wz1q33fv6-libwebp-1.6.0/lib/pkgconfig:/nix/store/qi0whsif4mi6a0d88d51qk4fa6bgns89-libsndfile-1.2.2-dev/lib/pkgconfig:/nix/store/kh6rcf357qh2c5593qxsp97xlpayx5vy-soxr-0.1.3-dev/lib/pkgconfig:/nix/store/ihh9hvdxwn8x7dacz5pkk8nqxsrkgy09-ffmpeg-headless-9.0.2-dev/lib/pkgconfig
++ PKG_CONFIG_PATH=/nix/store/qi0whsif4mi6a0d88d51qk4fa6bgns89-libsndfile-1.2.2-dev/lib/pkgconfig:/nix/store/ym4x29qyz0pr1r4qd82y2836bdycfl2f-rocm-runtime-10.1/lib/pkgconfig:/nix/store/i8jf1bw06qbvb9w7apkz1zy796fnyizw-icu4c-78.3-dev/lib/pkgconfig:/nix/store/zxvysjs44vl0hh0iqmh1s9jfjv9725x9-curl-8.22.0-dev/lib/pkgconfig:/nix/store/vqqz42af3hm89plcfg6sxmic32v2praa-brotli-1.2.0-dev/lib/pkgconfig:/nix/store/36jqif7m8jgnk14zaxzs6fl9lknjch8w-krb5-1.22.2-dev/lib/pkgconfig:/nix/store/f5f0aiz1kvr59vxaw90sh1l37sawbbw0-nghttp2-1.70.0-dev/lib/pkgconfig:/nix/store/ii34lqar1njxh1iwdh8x1jn64a6dwb6k-nghttp3-1.18.0-dev/lib/pkgconfig:/nix/store/3a2f8ap1mw785l27mrwxjnbkx8p96r09-ngtcp2-1.23.0-dev/lib/pkgconfig:/nix/store/i1kkgraqhy9g3ji3mp8xp3hf9mwzxmbr-libidn2-2.3.8-dev/lib/pkgconfig:/nix/store/wps4g7kaj73d2zs53a5cfimw1bnb3c99-openssl-3.5.9-dev/lib/pkgconfig:/nix/store/k06ix9y47imj2qwk22633l76k1ijkpk5-libpsl-0.21.5-dev/lib/pkgconfig:/nix/store/f995x45394l89346wpwkpc08fxj8glvg-libssh2-1.11.1-dev/lib/pkgconfig:/nix/store/a76rmqrp6l3w6h9pppfwzb3s6dzi0y4g-zlib-1.3.2-dev/share/pkgconfig:/nix/store/l9f17m3j280r2gmb7gksl4r1dycxylin-zstd-1.5.7-dev/lib/pkgconfig:/nix/store/27jrn36s7jkk6xv6vgi9kq8shkybafp1-libpng-apng-1.6.59-dev/lib/pkgconfig:/nix/store/bknqdwimgfpajqyarn8hs6fm08zn86cn-libjpeg-turbo-3.2.0-dev/lib/pkgconfig:/nix/store/xg48dl68ar4ivqlid9rbdi3wz1q33fv6-libwebp-1.6.0/lib/pkgconfig:/nix/store/qi0whsif4mi6a0d88d51qk4fa6bgns89-libsndfile-1.2.2-dev/lib/pkgconfig:/nix/store/kh6rcf357qh2c5593qxsp97xlpayx5vy-soxr-0.1.3-dev/lib/pkgconfig:/nix/store/ihh9hvdxwn8x7dacz5pkk8nqxsrkgy09-ffmpeg-headless-9.0.2-dev/lib/pkgconfig
++ cd /home/volmarr/src/gufo-dev
++ cmake --build build/gpu-test --target gemma4_target_test -j 8
+[0/2] Re-checking globbed directories...
+[1/7] Building the Rust PNG decoder (checked)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.00s
+[2/7] Building CXX object extensions/build/gemma4/build/CMakeFiles/gufo_gemma4_hip.dir/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp.o
+/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp: In constructor ‘gufo::models::gemma4::ContinuationAdapter::ContinuationAdapter(std::shared_ptr<gufo::models::gemma4::Model>, uint32_t, gufo::cache::Identity)’:
+/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp:323:6: warning: missing initializer for member ‘gufo::cache::ComponentDescriptor::id’ [-Wmissing-field-initializers]
+  323 |   add(ContinuationPart::kTokens, 0,
+      |   ~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  324 |       {.kind = cache::ComponentKind::kAppendRows,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  325 |        .row_bytes = sizeof(TokenId),
+      |        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  326 |        .rows_per_chunk = kGlobalChunkRows});
+      |        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp:339:65: warning: missing initializer for member ‘gufo::cache::ComponentDescriptor::id’ [-Wmissing-field-initializers]
+  339 |                                            .window_rows = window}
+      |                                                                 ^
+/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp:343:55: warning: missing initializer for member ‘gufo::cache::ComponentDescriptor::id’ [-Wmissing-field-initializers]
+  343 |                     .rows_per_chunk = kGlobalChunkRows});
+      |                                                       ^
+/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp:346:6: warning: missing initializer for member ‘gufo::cache::ComponentDescriptor::id’ [-Wmissing-field-initializers]
+  346 |   add(ContinuationPart::kLogits, 0,
+      |   ~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  347 |       {.kind = cache::ComponentKind::kPrivateState,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  348 |        .state_bytes = std::size_t{model_->VocabSize()} * sizeof(float)});
+      |        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp:349:6: warning: missing initializer for member ‘gufo::cache::ComponentDescriptor::id’ [-Wmissing-field-initializers]
+  349 |   add(ContinuationPart::kHidden, 0,
+      |   ~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  350 |       {.kind = cache::ComponentKind::kPrivateState,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  351 |        .state_bytes = std::size_t{c.hidden_size} * sizeof(float)});
+      |        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/volmarr/src/gemma4-gufo-extension/continuation_adapter.cpp:352:6: warning: missing initializer for member ‘gufo::cache::ComponentDescriptor::id’ [-Wmissing-field-initializers]
+  352 |   add(ContinuationPart::kMetadata, 0,
+      |   ~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  353 |       {.kind = cache::ComponentKind::kPrivateState,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  354 |        .state_bytes = sizeof(Metadata)});
+      |        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[3/7] Building CXX object extensions/build/gemma4/build/CMakeFiles/gemma4_target_test.dir/home/volmarr/src/gemma4-gufo-extension/tests/target_test.cpp.o
+[4/7] Building CXX object extensions/build/gemma4/build/CMakeFiles/gufo_gemma4_hip.dir/home/volmarr/src/gemma4-gufo-extension/engine.cpp.o
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp: In member function ‘bool gufo::models::gemma4::Session::DecodeStep(std::size_t, gufo::sampling::SamplerState&, DecodeResult*, std::string*, bool)’:
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1205:41: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::rows’ [-Wmissing-field-initializers]
+ 1205 |               .stop_at_eos = stop_at_eos};
+      |                                         ^
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1205:41: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::proposals’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1205:41: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::siblings’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1205:41: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::sibling_signals’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1205:41: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::signals’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1205:41: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::trace’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1205:41: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::draft’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp: In static member function ‘static bool gufo::models::gemma4::Session::DecodeBatch(std::span<BatchDecode>)’:
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1813:51: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::rows’ [-Wmissing-field-initializers]
+ 1813 |                       .stop_at_eos = d.stop_at_eos};
+      |                                                   ^
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1813:51: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::proposals’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1813:51: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::siblings’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1813:51: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::sibling_signals’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1813:51: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::signals’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1813:51: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::trace’ [-Wmissing-field-initializers]
+/home/volmarr/src/gemma4-gufo-extension/engine.cpp:1813:51: warning: missing initializer for member ‘gufo::models::gemma4::Session::Cycle::draft’ [-Wmissing-field-initializers]
+[5/7] Linking HIP static library extensions/build/gemma4/build/libgufo_gemma4_hip.a
+[6/7] Linking HIP executable extensions/build/gemma4/build/gemma4_target_test
++ GUFO_GEMMA4_MODEL=/home/volmarr/models/gufo/gemma-4-26B-A4B-it-heretic.Q8_0.gguf
++ ctest --test-dir build/gpu-test -R gemma4.target --output-on-failure
+Test project /home/volmarr/src/gufo-dev/build/gpu-test
+    Start 157: gemma4.target
+1/1 Test #157: gemma4.target ....................***Failed   15.90 sec
+2026-11-18 01:50:17 [WARN] [gemma4] unqualified gemma4 chat template (sha256 2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c); rendering prompts with the built-in gemma4-unsloth-845f1ee4 template
+decode:  mean KL 1.38831e-06, max 2.11222e-05, top-1 22/22
+8-row:   mean KL 1.36559e-06, top-1 22/22
+prefill: mean KL 1.92046e-05, max 0.000115625, top-1 22/22
+FAIL: boundary snapshot diverges after its tail
+
+
+0% tests passed, 1 tests failed out of 1
+
+Label Time Summary:
+external-model    =  15.90 sec*proc (1 test)
+gemma4            =  15.90 sec*proc (1 test)
+gfx1151           =  15.90 sec*proc (1 test)
+gpu               =  15.90 sec*proc (1 test)
+hip               =  15.90 sec*proc (1 test)
+quality           =  15.90 sec*proc (1 test)
+slow              =  15.90 sec*proc (1 test)
+
+Total Test time (real) =  15.90 sec
+
+The following tests FAILED:
+	157 - gemma4.target (Failed)                            external-model gemma4 gfx1151 gpu hip quality slow
+Errors while running CTest
++ exit 13

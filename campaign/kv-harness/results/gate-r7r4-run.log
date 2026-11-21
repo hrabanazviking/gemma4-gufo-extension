@@ -1,0 +1,15 @@
+gate-r7r4 start 2026-11-17T17:09:26-05:00
+MemAvailable:   124313532 kB
+bin: /home/volmarr/src/gemma4-gufo-extension/result/bin/gufo -> /nix/store/csnxpnmqfimd553kgyshnfb3jmlmiiz5-gufo-0-unstable-4938016
+header: ./kv_cache_format.hpp
+q8_0 derived-K reconstruction: max_abs_err=0.015822 snr_db=47.14
+q8_0 K-row roundtrip: max_abs_err=0.010000 max_abs_err_calm_blocks=0.008366 snr_db=48.25
+q8_0 V-row roundtrip: max_abs_err=0.010000 max_abs_err_calm_blocks=0.008249 snr_db=48.15
+q8_0 ring layout: slots=8 wraps=2 max_abs_err=0.006234
+PASS
+HOST_TEST_PASS
+done: /home/volmarr/src/gemma4-gufo-extension/campaign/kv-harness/results/r7gate-q8/summary.txt
+probes done: /home/volmarr/src/gemma4-gufo-extension/campaign/kv-harness/results/r7gate-q8/probes
+done: /home/volmarr/src/gemma4-gufo-extension/campaign/kv-harness/results/r7gate-f16/summary.txt
+probes done: /home/volmarr/src/gemma4-gufo-extension/campaign/kv-harness/results/r7gate-f16/probes
+gate-r7r4 done 2026-11-17T17:28:05-05:00

@@ -1,0 +1,22 @@
+[0/2] Re-checking globbed directories...
+[1/4] Building the Rust PNG decoder (checked)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.01s
+[2/4] Building CXX object extensions/build/gemma4/build/CMakeFiles/gemma4_continuation_test.dir/home/volmarr/src/gemma4-gufo-extension/tests/continuation_test.cpp.o
+[3/4] Linking HIP executable extensions/build/gemma4/build/gemma4_continuation_test
+Test project /home/volmarr/src/gufo-dev/build/gpu-test
+    Start 158: gemma4.continuation
+1/2 Test #158: gemma4.continuation ..............   Passed   10.75 sec
+    Start 163: gemma4.continuation_perturbed
+2/2 Test #163: gemma4.continuation_perturbed ....   Passed   10.75 sec
+
+100% tests passed out of 2
+
+Label Time Summary:
+cache             =  21.49 sec*proc (2 tests)
+external-model    =  21.49 sec*proc (2 tests)
+gemma4            =  21.49 sec*proc (2 tests)
+gfx1151           =  21.49 sec*proc (2 tests)
+gpu               =  21.49 sec*proc (2 tests)
+hip               =  21.49 sec*proc (2 tests)
+
+Total Test time (real) =  21.50 sec

@@ -1,0 +1,2 @@
+[Model Load]: 4.19156 s
+Paris

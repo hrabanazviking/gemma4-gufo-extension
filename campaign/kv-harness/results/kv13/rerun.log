@@ -1,0 +1,31 @@
+[0/2] Re-checking globbed directories...
+[1/4] Building the Rust PNG decoder (checked)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.00s
+MoveKey f16 control: byte-exact, ring wrap included
+MoveKey q8_0: byte-exact, ring wrap included
+PASS
+build/gpu-test/extensions/build/gemma4/build/gemma4_kv13_machinery_test
+2026-11-18 01:54:05 [WARN] [gemma4] unqualified gemma4 chat template (sha256 2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c); rendering prompts with the built-in gemma4-unsloth-845f1ee4 template
+2026-11-18 01:54:11 [WARN] [gemma4] unqualified gemma4 chat template (sha256 2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c); rendering prompts with the built-in gemma4-unsloth-845f1ee4 template
+2026-11-18 01:54:17 [WARN] [gemma4] unqualified gemma4 chat template (sha256 2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c); rendering prompts with the built-in gemma4-unsloth-845f1ee4 template
+snapshot proof f16: 227894088 bytes, bitwise continuation + rollback
+snapshot proof q8_0: 121568088 bytes, bitwise continuation + rollback
+cross-format refusal: both directions, both paths
+PASS
+Test project /home/volmarr/src/gufo-dev/build/gpu-test
+    Start 161: gemma4.kv13_movekey
+1/2 Test #161: gemma4.kv13_movekey ..............   Passed    0.28 sec
+    Start 162: gemma4.kv13_machinery
+2/2 Test #162: gemma4.kv13_machinery ............   Passed   16.12 sec
+
+100% tests passed out of 2
+
+Label Time Summary:
+cache             =  16.12 sec*proc (1 test)
+external-model    =  16.12 sec*proc (1 test)
+gemma4            =  16.40 sec*proc (2 tests)
+gfx1151           =  16.40 sec*proc (2 tests)
+gpu               =  16.40 sec*proc (2 tests)
+hip               =  16.40 sec*proc (2 tests)
+
+Total Test time (real) =  16.40 sec

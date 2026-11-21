@@ -1,0 +1,8 @@
+[gemma4] kv cache type: q8_0 (from GUFO_KV_CACHE_TYPE)
+2026-11-17 17:13:59 [WARN] [gemma4] unqualified gemma4 chat template (sha256 2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c); rendering prompts with the built-in gemma4-unsloth-845f1ee4 template
+[Model Load]: 4.17856 s
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Gemma 4 26B A4B It Heretic       |  25.02 GiB | ROCm (HIP) |              pp512 |       2192.41 ± 0.00 |
+| Gemma 4 26B A4B It Heretic       |  25.02 GiB | ROCm (HIP) |              tg128 |         36.69 ± 0.00 |
+

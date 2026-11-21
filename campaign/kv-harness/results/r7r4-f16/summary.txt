@@ -1,0 +1,44 @@
+label: r7r4-f16
+date: 2026-11-17T16:24:33-05:00
+gufo: gufo version development (4938016)
+Extension API: 0.2.14
+Extension selection: discovery
+Built extensions:
+  deepseek_v4_flash 0.1.0 (src/models/deepseek_v4_flash)
+  embedding_gemma2 0.1.0 (src/models/embedding_gemma2)
+  gemma4 0.1.0 (../../nix/store/nl5zf7ik805vwajlnxdasj1z7nfgilsr-source)
+  minimax_h3 0.1.0 (src/models/minimax_h3)
+  qwen 0.1.0 (src/models/qwen)
+  qwen38_flash_next 0.1.0 (src/models/qwen38_flash_next)
+  qwen3_asr 0.1.0 (src/models/qwen3_asr)
+  qwen3_tts 0.1.0 (src/models/qwen3_tts)
+  qwen_image_21 0.1.0 (src/models/qwen_image_21)
+  provider deepseek4: available
+  provider embeddinggemma-2: available
+  provider gemma4: available
+  provider minimax-h3: available
+  provider qwen27-q4: available
+  provider flash-next-q4: available
+  provider qwen3-asr: available
+  provider qwen3-tts: available
+  provider qwen-image-21: available
+model: /home/volmarr/models/gufo/gemma-4-26B-A4B-it-heretic.Q8_0.gguf
+MemAvailable:   124298372 kB
+pp512 warmup: 2079.00
+pp512 runs: 2109.93 2099.43 2135.79 2160.31 2162.23
+pp512 MEDIAN: 2135.79
+pp4096 warmup: 2737.65
+pp4096 runs: 2733.38 2597.03 2504.19 2630.71 2558.43
+pp4096 MEDIAN: 2597.03
+pp16384 warmup: 2250.13
+pp16384 runs: 2199.23 2117.84 2142.90 2088.51 2140.55
+pp16384 MEDIAN: 2140.55
+tg512 warmup: 41.75
+tg512 runs: 41.66 41.80 42.00 41.88 41.85
+tg512 MEDIAN: 41.85
+tg4096 warmup: 40.39
+tg4096 runs: 40.44 40.37 40.46 40.41 40.30
+tg4096 MEDIAN: 40.41
+tg16384 warmup: 38.68
+tg16384 runs: 38.62 38.72 38.71 38.84 38.73
+tg16384 MEDIAN: 38.72

@@ -1,0 +1,10 @@
+gate-r3 start 2026-11-18T00:17:17-05:00
+MemAvailable:   124286812 kB
+q8_0 derived-K reconstruction: max_abs_err=0.015822 snr_db=47.14
+q8_0 K-row roundtrip: max_abs_err=0.010000 max_abs_err_calm_blocks=0.008366 snr_db=48.25
+q8_0 V-row roundtrip: max_abs_err=0.010000 max_abs_err_calm_blocks=0.008249 snr_db=48.15
+q8_0 ring layout: slots=8 wraps=2 max_abs_err=0.006234
+PASS
+HOST_TEST_PASS
+MemAvailable:   124233796 kB
+gate-r3 done 2026-11-18T00:38:00-05:00
